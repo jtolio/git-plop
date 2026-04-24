@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+
+USAGE = """git-plop
+
+git-plop enables updating multiple remote branches from unmerged commits on a single
+local branch.
+
+git-plop aim [remote-branch]
+
+    This command amends the current HEAD commit to add or set a new git commit message trailer
+    that specifies where this commit will get pushed. The value of the trailer is remote-branch.
+
+    If remote-branch is not specified, it is generated with the following format:
+
+        <namespace>/<trimmed-message>-<shortcode>
+
+    <namespace> is determined by either looking in git config for plop.remote_namespace or using
+    the current username.
+    <trimmed-message> is determined by taking the first 12 alphanumeric characters of the commit
+    message. Non-alphanumeric characters are replaced with dashes.
+    <shortcode> is 6 random base 32 digits from /dev/urandom.
+
+git-plop lob [remote [ref]]
+
+    This command looks at the ref, finds the merge-base of ref and the current remote tracking
+    branch (or the default branch on the remote if no tracking branch is found), and then, for each
+    commit in that chain, considers whether it has been aimed (it has the commit message trailer).
+    A single refspec is generated that is pushed to the remote with --atomic and --force-with-lease
+    that updates the specified remote branch for every commit that is found to have the trailer.
+    No other refs besides aimed refs are pushed.
+
+    If remote is not specified, it defaults to the default remote that git push would use.
+    If ref is not specified, it defaults to HEAD.
+"""
+
+import re
+import subprocess
+
+
+class Repo:
+    def __init__(self, git_dir=None):
+        self.git_dir = git_dir
+
+    def _git_cmd(self, base_cmd):
+        if self.git_dir is None:
+            return base_cmd
+        return [base_cmd[0], "--git-dir", self.git_dir] + base_cmd[1:]
+
+    def run(self, args, **kwargs):
+        return subprocess.check_output(self._git_cmd(["git"] + args), text=True, **kwargs)
+
+    def read_commit(self, ref):
+        raw = self.run(["cat-file", "-p", ref])
+        header, sep, body = raw.partition("\n\n")
+        if not sep:
+            return raw, ""
+        return header, body
+
+    def parse_trailers(self, message):
+        result = self.run(
+            ["interpret-trailers", "--parse"],
+            input=message,
+        )
+        return [line for line in result.splitlines() if line]
+
+    def write_commit_object(self, header, body):
+        full = header + "\n\n" + body
+        if full and not full.endswith("\n"):
+            full += "\n"
+        result = self.run(
+            ["hash-object", "-t", "commit", "-w", "--stdin"],
+            input=full,
+        )
+        return result.strip()
+
+    def update_head(self, new_commit):
+        try:
+            symref = self.run(["symbolic-ref", "-q", "HEAD"])
+        except:
+            self.run(["update-ref", "HEAD", new_commit])
+        else:
+            self.run(["update-ref", symref.strip(), new_commit])
+
+    def validate(self):
+        self.run(["rev-parse", "--git-dir"])
+        self.run(["rev-parse", "HEAD"])
+
+    def remove_trailer_from_message(self, key, msg):
+        trailers = self.parse_trailers(msg)
+        key_pattern = re.compile(rf"^{re.escape(key)}\s*[:=#]\s*")
+        to_remove = {line for line in trailers if key_pattern.match(line)}
+        if not to_remove:
+            return msg
+        return "\n".join(line for line in msg.splitlines() if line not in to_remove)
+
+    def make_commit(self, header, new_body):
+        new_commit = self.write_commit_object(header, new_body)
+        self.update_head(new_commit)
+
+    def set_trailer(self, key, value):
+        header, msg = self.read_commit("HEAD")
+        if value:
+            msg = self.remove_trailer_from_message(key, msg)
+            result = self.run(
+                ["interpret-trailers", "--trailer", f"{key}={value}"],
+                input=msg,
+            )
+            self.make_commit(header, result)
+        else:
+            new_msg = self.remove_trailer_from_message(key, msg)
+            if new_msg != msg:
+                self.make_commit(header, new_msg)
+
+    def get_trailer(self, ref, key):
+        _, msg = self.read_commit(ref)
+        trailers = self.parse_trailers(msg)
+        pattern = re.compile(rf"^{re.escape(key)}\s*[:=#]\s*(.*)")
+        for line in trailers:
+            m = pattern.match(line)
+            if m:
+                print(m.group(1))
+
+    def show_all_trailers(self, ref):
+        _, msg = self.read_commit(ref)
+        trailers = self.parse_trailers(msg)
+        if trailers:
+            print("\n".join(trailers))
+
+
