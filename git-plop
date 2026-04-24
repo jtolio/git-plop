@@ -29,8 +29,29 @@ git-plop lob [remote [ref]]
     that updates the specified remote branch for every commit that is found to have the trailer.
     No other refs besides aimed refs are pushed.
 
+    The commit chain from merge-base to ref must be a unique linear path. If multiple paths
+    exist, an error is raised.
+
     If remote is not specified, it defaults to the default remote that git push would use.
     If ref is not specified, it defaults to HEAD.
+
+git-plop align [remote]
+
+    This command aligns submodule pointers across commits between the merge-base and HEAD.
+
+    For each submodule, it finds the submodule's ref at the merge-base (the base ref) and
+    the submodule's current HEAD. It then walks commits on both the outer repo and the
+    submodule, matching them by shared X-Dest-Branch trailers.
+
+    For each commit in the outer repo, the submodule pointer is set to match the parent
+    commit's pointer, unless the commit has a destination branch that is shared with the
+    submodule, in which case the pointer advances to the submodule commit with that
+    destination branch.
+
+    Shared destination branches must appear in the same order in both the outer repo and
+    the submodule. If they don't, an error is raised.
+
+    If remote is not specified, it defaults to the default remote that git push would use.
 """
 
 import re
@@ -55,13 +76,18 @@ def generate_shortcode():
 
 
 class Repo:
-    def __init__(self, git_dir=None):
+    def __init__(self, git_dir=None, work_dir=None):
         self.git_dir = git_dir
+        self.work_dir = work_dir
 
     def _git_cmd(self, base_cmd):
-        if self.git_dir is None:
-            return base_cmd
-        return [base_cmd[0], "--git-dir", self.git_dir] + base_cmd[1:]
+        result = [base_cmd[0]]
+        if self.work_dir is not None:
+            result += ["-C", self.work_dir]
+        if self.git_dir is not None:
+            result += ["--git-dir", self.git_dir]
+        result += base_cmd[1:]
+        return result
 
     def run(self, args, **kwargs):
         return subprocess.check_output(self._git_cmd(["git"] + args), text=True, **kwargs)
@@ -190,11 +216,123 @@ class Repo:
             pass
 
         try:
-            return repo.run(["symbolic-ref", f"refs/remotes/{remote}/HEAD"]).strip()
+            return self.run(["symbolic-ref", f"refs/remotes/{remote}/HEAD"]).strip()
         except subprocess.CalledProcessError:
             pass
 
         raise SystemExit("error: could not determine merge base from here")
+
+    def find_unique_path(self, start, end):
+        start_hash = self.run(["rev-parse", start]).strip()
+        end_hash = self.run(["rev-parse", end]).strip()
+        if start_hash == end_hash: return []
+
+        try:
+            output = self.run(
+                ["rev-list", "--ancestry-path", "--parents",
+                 f"{start_hash}..{end_hash}"]
+            )
+        except subprocess.CalledProcessError:
+            raise SystemExit(
+                f"error: no path found from {start_hash[:12]} to {end_hash[:12]}")
+
+        ancestors = {}
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split()
+            commit = parts[0]
+            parents = parts[1:]
+            if len(parents) > 1:
+                raise SystemExit("merge commit rejected")
+            ancestors[commit] = parents[0]
+
+        node = end_hash
+        path = []
+        while node != start_hash:
+            path.append(node)
+            node = ancestors[node]
+
+        return list(reversed(path))
+
+    def get_toplevel(self):
+        return self.run(["rev-parse", "--show-toplevel"]).strip()
+
+    def read_tree(self, tree_hash):
+        output = self.run(["ls-tree", tree_hash])
+        entries = []
+        for line in output.splitlines():
+            if not line:
+                continue
+            meta, name = line.split("\t", 1)
+            parts = meta.split()
+            entries.append((parts[0], parts[1], parts[2], name))
+        return entries
+
+    def write_tree(self, entries):
+        input_data = "".join(
+            f"{mode} {type_} {hash_}\t{name}\n"
+            for mode, type_, hash_, name in entries
+        )
+        return self.run(["mktree"], input=input_data).strip()
+
+    def update_tree_entry(self, tree_hash, path, new_hash):
+        parts = path.split("/", 1)
+        name = parts[0]
+
+        entries = self.read_tree(tree_hash)
+
+        if len(parts) == 1:
+            new_entries = []
+            found = False
+            for mode, type_, hash_, entry_name in entries:
+                if entry_name == name:
+                    new_entries.append((mode, type_, new_hash, entry_name))
+                    found = True
+                else:
+                    new_entries.append((mode, type_, hash_, entry_name))
+            if not found:
+                raise SystemExit(
+                    f"error: entry '{name}' not found in tree {tree_hash[:12]}")
+            return self.write_tree(new_entries)
+
+        rest = parts[1]
+        new_entries = []
+        found = False
+        for mode, type_, hash_, entry_name in entries:
+            if entry_name == name:
+                new_subtree = self.update_tree_entry(hash_, rest, new_hash)
+                new_entries.append((mode, type_, new_subtree, entry_name))
+                found = True
+            else:
+                new_entries.append((mode, type_, hash_, entry_name))
+        if not found:
+            raise SystemExit(
+                f"error: directory '{name}' not found in tree "
+                f"{tree_hash[:12]}")
+        return self.write_tree(new_entries)
+
+    def get_submodules(self, ref="HEAD"):
+        output = self.run(["ls-tree", "-r", ref])
+        submodules = []
+        for line in output.splitlines():
+            if not line:
+                continue
+            meta, name = line.split("\t", 1)
+            mode = meta.split()[0]
+            if mode == "160000":
+                submodules.append(name)
+        return submodules
+
+    def get_submodule_ref(self, commit, submodule_path):
+        try:
+            output = self.run(["ls-tree", commit, "--", submodule_path])
+        except subprocess.CalledProcessError:
+            return None
+        if not output.strip():
+            return None
+        meta, _ = output.strip().split("\t", 1)
+        return meta.split()[2]
 
     def aim(self, remote_branch=None):
         if remote_branch is None:
@@ -211,8 +349,7 @@ class Repo:
         base_ref = self.get_merge_base_ref(remote)
         merge_base = self.run(["merge-base", base_ref, ref]).strip()
 
-        output = self.run(["rev-list", "--ancestry-path", "--reverse", f"{merge_base}..{ref}"])
-        commits = [c for c in output.splitlines() if c]
+        commits = self.find_unique_path(merge_base, ref)
 
         if not commits:
             print("No commits found.", file=sys.stderr)
@@ -230,6 +367,148 @@ class Repo:
 
         self.run(["push", "--atomic", "--force-with-lease", remote] + refspecs)
 
+    def align(self, remote=None):
+        if remote is None:
+            remote = self.get_default_remote()
+
+        # Find merge base of outer repo
+        base_ref = self.get_merge_base_ref(remote)
+        merge_base = self.run(["merge-base", base_ref, "HEAD"]).strip()
+
+        # Get unique path from merge-base to HEAD
+        a_commits = self.find_unique_path(merge_base, "HEAD")
+        if not a_commits:
+            print("No commits to align.", file=sys.stderr)
+            return
+
+        # Collect dest branches from A commits (in order)
+        a_branches = []
+        for commit in a_commits:
+            dest = self.get_trailer(commit, TRAILER_KEY)
+            if dest:
+                a_branches.append((commit, dest))
+
+        # Find submodules at HEAD
+        submodules = self.get_submodules("HEAD")
+        if not submodules:
+            print("No submodules found.", file=sys.stderr)
+            return
+
+        toplevel = self.get_toplevel()
+
+        # For each submodule, compute target B ref for each A commit
+        submodule_targets = {}
+
+        for sub_path in submodules:
+            # B0: what A's merge-base says the submodule should be
+            b0 = self.get_submodule_ref(merge_base, sub_path)
+            if b0 is None:
+                continue
+
+            # B HEAD: the submodule's actual current commit
+            sub_repo = Repo(work_dir=toplevel + "/" + sub_path)
+            b_head = sub_repo.run(["rev-parse", "HEAD"]).strip()
+
+            if b0 == b_head:
+                continue
+
+            b_commits = sub_repo.find_unique_path(b0, b_head)
+            if not b_commits:
+                continue
+
+            # Collect dest branches from B commits (in order)
+            b_branches = []
+            for commit in b_commits:
+                dest = sub_repo.get_trailer(commit, TRAILER_KEY)
+                if dest:
+                    b_branches.append((commit, dest))
+
+            # Find shared destination branches
+            a_branch_set = {b for _, b in a_branches}
+            b_branch_set = {b for _, b in b_branches}
+            shared = a_branch_set & b_branch_set
+
+            if not shared:
+                continue
+
+            # Verify shared branches appear in the same order
+            a_shared_order = [b for _, b in a_branches if b in shared]
+            b_shared_order = [b for _, b in b_branches if b in shared]
+            if a_shared_order != b_shared_order:
+                raise SystemExit(
+                    f"error: shared destination branches for submodule "
+                    f"'{sub_path}' appear in different order in outer repo "
+                    f"and submodule")
+
+            # Map shared dest branch -> B commit
+            b_branch_to_commit = {}
+            for commit, branch in b_branches:
+                if branch in shared:
+                    b_branch_to_commit[branch] = commit
+
+            # Walk A commits oldest-to-newest, advancing B pointer on shared
+            # dest branch matches. Commits without a shared dest branch
+            # inherit the pointer from the previous commit (starting at B0).
+            b_pointer = b0
+            targets = {}
+            for commit in a_commits:
+                dest = self.get_trailer(commit, TRAILER_KEY)
+                if dest and dest in shared:
+                    b_pointer = b_branch_to_commit[dest]
+                targets[commit] = b_pointer
+
+            submodule_targets[sub_path] = targets
+
+        # Rewrite A commits with updated submodule pointers and parent chains
+        commit_map = {}
+
+        for commit in a_commits:
+            header, body = self.read_commit(commit)
+
+            header_lines = header.split("\n")
+            tree_hash = None
+            new_header_lines = []
+            for line in header_lines:
+                if line.startswith("tree "):
+                    tree_hash = line.split(" ", 1)[1]
+                    new_header_lines.append(line)
+                elif line.startswith("parent "):
+                    parent = line.split(" ", 1)[1]
+                    if parent in commit_map:
+                        new_header_lines.append(
+                            f"parent {commit_map[parent]}")
+                    else:
+                        new_header_lines.append(line)
+                else:
+                    new_header_lines.append(line)
+
+            # Update tree for each submodule
+            new_tree = tree_hash
+            for sub_path, targets in submodule_targets.items():
+                new_tree = self.update_tree_entry(
+                    new_tree, sub_path, targets[commit])
+
+            # Rebuild header with updated tree hash
+            final_header = "\n".join(
+                f"tree {new_tree}" if line.startswith("tree ") else line
+                for line in new_header_lines
+            )
+
+            new_sha = self.write_commit_object(final_header, body)
+            commit_map[commit] = new_sha
+
+        # Update HEAD if anything changed
+        last_old = a_commits[-1]
+        last_new = commit_map[last_old]
+        if last_new != last_old:
+            self.update_head(last_new)
+            sub_names = ", ".join(sorted(submodule_targets.keys()))
+            print(
+                f"Aligned {len(submodule_targets)} submodule(s) ({sub_names}) "
+                f"across {len(a_commits)} commit(s).")
+        else:
+            print("Submodules already aligned.", file=sys.stderr)
+
 
 def main():
     args = sys.argv[1:]
@@ -245,13 +524,18 @@ def main():
 
     if cmd == "aim":
         remote_branch = args[1] if len(args) > 1 else None
-        aim(repo, remote_branch)
+        repo.aim(remote_branch)
         return
 
     if cmd == "lob":
         remote = args[1] if len(args) > 1 else None
         ref = args[2] if len(args) > 2 else None
-        lob(repo, remote, ref)
+        repo.lob(remote, ref)
+        return
+
+    if cmd == "align":
+        remote = args[1] if len(args) > 1 else None
+        repo.align(remote)
         return
 
     print(f"Unknown command: {cmd}", file=sys.stderr)
