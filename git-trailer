@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Edit git commit trailers on the current commit using plumbing commands."""
+
+import argparse
+import re
+import subprocess
+import sys
+
+
+def git_output(args, **kwargs):
+    return subprocess.check_output(["git"] + args, text=True, **kwargs)
+
+
+def git_run(args, **kwargs):
+    return subprocess.run(["git"] + args, **kwargs)
+
+
+def read_head_commit():
+    raw = git_output(["cat-file", "-p", "HEAD"])
+    header, sep, body = raw.partition("\n\n")
+    if not sep:
+        return raw, ""
+    return header, body
+
+
+def write_commit_object(header, body):
+    full = header + "\n\n" + body
+    if full and not full.endswith("\n"):
+        full += "\n"
+    result = git_run(
+        ["hash-object", "-t", "commit", "-w", "--stdin"],
+        input=full,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"fatal: hash-object failed: {result.stderr}", file=sys.stderr)
+        sys.exit(1)
+    return result.stdout.strip()
+
+
+def update_head(new_commit):
+    symref = git_run(["symbolic-ref", "-q", "HEAD"], capture_output=True, text=True)
+    if symref.returncode == 0:
+        ref = symref.stdout.strip()
+        git_run(["update-ref", ref, new_commit], check=True)
+    else:
+        git_run(["update-ref", "HEAD", new_commit], check=True)
+
+
+def make_commit(header, new_body):
+    new_commit = write_commit_object(header, new_body)
+    update_head(new_commit)
+
+
+def parse_trailers(message):
+    result = git_run(
+        ["interpret-trailers", "--parse"],
+        input=message,
+        capture_output=True,
+        text=True,
+    )
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def remove_trailer_from_message(key, msg):
+    """Return a new message with all trailers matching *key* removed."""
+    trailers = parse_trailers(msg)
+    print(trailers)
+    key_pattern = re.compile(rf"^{re.escape(key)}\s*[:=#]\s*")
+    to_remove = {line for line in trailers if key_pattern.match(line)}
+    if not to_remove:
+        return msg
+    return "\n".join(line for line in msg.splitlines() if line not in to_remove)
+
+
+def set_trailer(key, value):
+    header, msg = read_head_commit()
+    if value:
+        msg = remove_trailer_from_message(key, msg)
+        result = git_run(
+            ["interpret-trailers", "--trailer", f"{key}={value}"],
+            input=msg,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        make_commit(header, result.stdout)
+    else:
+        new_msg = remove_trailer_from_message(key, msg)
+        if new_msg != msg:
+            make_commit(header, new_msg)
+
+
+def get_trailer(key):
+    _, msg = read_head_commit()
+    trailers = parse_trailers(msg)
+    pattern = re.compile(rf"^{re.escape(key)}\s*[:=#]\s*(.*)")
+    for line in trailers:
+        m = pattern.match(line)
+        if m:
+            print(m.group(1))
+
+
+def show_all_trailers():
+    _, msg = read_head_commit()
+    trailers = parse_trailers(msg)
+    if trailers:
+        print("\n".join(trailers))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Edit git commit trailers on the current commit.")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--set",
+        nargs=2,
+        metavar=("KEY", "VALUE"),
+        help="Set a trailer (empty VALUE removes it)",
+    )
+    group.add_argument(
+        "--get",
+        metavar="KEY",
+        help="Get the value of a trailer (empty if absent)",
+    )
+    group.add_argument(
+        "--show-all",
+        action="store_true",
+        help="Show all trailers",
+    )
+
+    args = parser.parse_args()
+
+    try:
+        git_run(["rev-parse", "--git-dir"], check=True, capture_output=True)
+        git_run(["rev-parse", "HEAD"], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        print("fatal: not a git repository or no commits", file=sys.stderr)
+        sys.exit(1)
+
+    if args.set:
+        set_trailer(args.set[0], args.set[1])
+    elif args.get:
+        get_trailer(args.get)
+    elif args.show_all:
+        show_all_trailers()
+    else:
+        show_all_trailers()
+
+
+if __name__ == "__main__":
+    main()
