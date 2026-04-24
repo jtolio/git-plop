@@ -90,7 +90,10 @@ class Repo:
         return result
 
     def run(self, args, **kwargs):
-        return subprocess.check_output(self._git_cmd(["git"] + args), text=True, **kwargs)
+        cmd = self._git_cmd(["git"] + args)
+        if args[0] in ("push", "hash-object", "update-ref", "mktree"):
+            print(cmd, file=sys.stderr)
+        return subprocess.check_output(cmd, text=True, **kwargs)
 
     def read_commit(self, ref):
         raw = self.run(["cat-file", "-p", ref])
