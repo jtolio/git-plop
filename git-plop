@@ -412,10 +412,13 @@ class Repo:
             sub_repo = Repo(work_dir=toplevel + "/" + sub_path)
             b_head = sub_repo.run(["rev-parse", "HEAD"]).strip()
 
+            # B latest committed:
+            b_remote = sub_repo.get_merge_base_ref(remote)
+
             if b0 == b_head:
                 continue
 
-            b_commits = sub_repo.find_unique_path(b0, b_head)
+            b_commits = sub_repo.find_unique_path(b_remote, b_head)
             if not b_commits:
                 continue
 
