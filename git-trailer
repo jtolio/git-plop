@@ -7,145 +7,144 @@ import subprocess
 import sys
 
 
-def git_output(args, **kwargs):
-    return subprocess.check_output(["git"] + args, text=True, **kwargs)
+class Repo:
+    def __init__(self, git_dir=None):
+        self.git_dir = git_dir
 
+    def _git_cmd(self, base_cmd):
+        if self.git_dir is None:
+            return base_cmd
+        return [base_cmd[0], "--git-dir", self.git_dir] + base_cmd[1:]
 
-def git_run(args, **kwargs):
-    return subprocess.run(["git"] + args, **kwargs)
+    def run(self, args, **kwargs):
+        return subprocess.check_output(self._git_cmd(["git"] + args), text=True, **kwargs)
 
+    def read_commit(self, ref):
+        raw = self.run(["cat-file", "-p", ref])
+        header, sep, body = raw.partition("\n\n")
+        if not sep:
+            return raw, ""
+        return header, body
 
-def read_head_commit():
-    raw = git_output(["cat-file", "-p", "HEAD"])
-    header, sep, body = raw.partition("\n\n")
-    if not sep:
-        return raw, ""
-    return header, body
-
-
-def write_commit_object(header, body):
-    full = header + "\n\n" + body
-    if full and not full.endswith("\n"):
-        full += "\n"
-    result = git_run(
-        ["hash-object", "-t", "commit", "-w", "--stdin"],
-        input=full,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print(f"fatal: hash-object failed: {result.stderr}", file=sys.stderr)
-        sys.exit(1)
-    return result.stdout.strip()
-
-
-def update_head(new_commit):
-    symref = git_run(["symbolic-ref", "-q", "HEAD"], capture_output=True, text=True)
-    if symref.returncode == 0:
-        ref = symref.stdout.strip()
-        git_run(["update-ref", ref, new_commit], check=True)
-    else:
-        git_run(["update-ref", "HEAD", new_commit], check=True)
-
-
-def make_commit(header, new_body):
-    new_commit = write_commit_object(header, new_body)
-    update_head(new_commit)
-
-
-def parse_trailers(message):
-    result = git_run(
-        ["interpret-trailers", "--parse"],
-        input=message,
-        capture_output=True,
-        text=True,
-    )
-    return [line for line in result.stdout.splitlines() if line]
-
-
-def remove_trailer_from_message(key, msg):
-    """Return a new message with all trailers matching *key* removed."""
-    trailers = parse_trailers(msg)
-    print(trailers)
-    key_pattern = re.compile(rf"^{re.escape(key)}\s*[:=#]\s*")
-    to_remove = {line for line in trailers if key_pattern.match(line)}
-    if not to_remove:
-        return msg
-    return "\n".join(line for line in msg.splitlines() if line not in to_remove)
-
-
-def set_trailer(key, value):
-    header, msg = read_head_commit()
-    if value:
-        msg = remove_trailer_from_message(key, msg)
-        result = git_run(
-            ["interpret-trailers", "--trailer", f"{key}={value}"],
-            input=msg,
-            capture_output=True,
-            text=True,
-            check=True,
+    def parse_trailers(self, message):
+        result = self.run(
+            ["interpret-trailers", "--parse"],
+            input=message,
         )
-        make_commit(header, result.stdout)
-    else:
-        new_msg = remove_trailer_from_message(key, msg)
-        if new_msg != msg:
-            make_commit(header, new_msg)
+        return [line for line in result.splitlines() if line]
 
+    def write_commit_object(self, header, body):
+        full = header + "\n\n" + body
+        if full and not full.endswith("\n"):
+            full += "\n"
+        result = self.run(
+            ["hash-object", "-t", "commit", "-w", "--stdin"],
+            input=full,
+        )
+        return result.strip()
 
-def get_trailer(key):
-    _, msg = read_head_commit()
-    trailers = parse_trailers(msg)
-    pattern = re.compile(rf"^{re.escape(key)}\s*[:=#]\s*(.*)")
-    for line in trailers:
-        m = pattern.match(line)
-        if m:
-            print(m.group(1))
+    def update_head(self, new_commit):
+        try:
+            symref = self.run(["symbolic-ref", "-q", "HEAD"])
+        except:
+            self.run(["update-ref", "HEAD", new_commit])
+        else:
+            self.run(["update-ref", symref.strip(), new_commit])
 
+    def validate(self):
+        self.run(["rev-parse", "--git-dir"])
+        self.run(["rev-parse", "HEAD"])
 
-def show_all_trailers():
-    _, msg = read_head_commit()
-    trailers = parse_trailers(msg)
-    if trailers:
-        print("\n".join(trailers))
+    def remove_trailer_from_message(self, key, msg):
+        trailers = self.parse_trailers(msg)
+        key_pattern = re.compile(rf"^{re.escape(key)}\s*[:=#]\s*")
+        to_remove = {line for line in trailers if key_pattern.match(line)}
+        if not to_remove:
+            return msg
+        return "\n".join(line for line in msg.splitlines() if line not in to_remove)
+
+    def make_commit(self, header, new_body):
+        new_commit = self.write_commit_object(header, new_body)
+        self.update_head(new_commit)
+
+    def set_trailer(self, key, value):
+        header, msg = self.read_commit("HEAD")
+        if value:
+            msg = self.remove_trailer_from_message(key, msg)
+            result = self.run(
+                ["interpret-trailers", "--trailer", f"{key}={value}"],
+                input=msg,
+            )
+            self.make_commit(header, result)
+        else:
+            new_msg = self.remove_trailer_from_message(key, msg)
+            if new_msg != msg:
+                self.make_commit(header, new_msg)
+
+    def get_trailer(self, ref, key):
+        _, msg = self.read_commit(ref)
+        trailers = self.parse_trailers(msg)
+        pattern = re.compile(rf"^{re.escape(key)}\s*[:=#]\s*(.*)")
+        for line in trailers:
+            m = pattern.match(line)
+            if m:
+                print(m.group(1))
+
+    def show_all_trailers(self, ref):
+        _, msg = self.read_commit(ref)
+        trailers = self.parse_trailers(msg)
+        if trailers:
+            print("\n".join(trailers))
 
 
 def main():
     parser = argparse.ArgumentParser(description="Edit git commit trailers on the current commit.")
+    parser.add_argument(
+        "--git-dir",
+        metavar="PATH",
+        help="Path to the git directory",
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--set",
         nargs=2,
         metavar=("KEY", "VALUE"),
-        help="Set a trailer (empty VALUE removes it)",
+        help="Set a trailer on HEAD (empty VALUE removes it)",
     )
     group.add_argument(
         "--get",
         metavar="KEY",
-        help="Get the value of a trailer (empty if absent)",
+        help="Get the value of a trailer from the specified ref (default: HEAD)",
     )
     group.add_argument(
         "--show-all",
         action="store_true",
-        help="Show all trailers",
+        help="Show all trailers from the specified ref (default: HEAD)",
+    )
+    parser.add_argument(
+        "ref",
+        nargs="?",
+        default="HEAD",
+        metavar="REF",
+        help="Reference to operate on (default: HEAD)",
     )
 
     args = parser.parse_args()
 
-    try:
-        git_run(["rev-parse", "--git-dir"], check=True, capture_output=True)
-        git_run(["rev-parse", "HEAD"], check=True, capture_output=True)
-    except subprocess.CalledProcessError:
-        print("fatal: not a git repository or no commits", file=sys.stderr)
-        sys.exit(1)
+    repo = Repo(git_dir=args.git_dir)
+    repo.validate()
 
     if args.set:
-        set_trailer(args.set[0], args.set[1])
+        if args.ref != "HEAD":
+            print("fatal: --set cannot be used with a custom ref (only HEAD is supported)", file=sys.stderr)
+            sys.exit(1)
+        repo.set_trailer(args.set[0], args.set[1])
     elif args.get:
-        get_trailer(args.get)
+        repo.get_trailer(args.ref, args.get)
     elif args.show_all:
-        show_all_trailers()
+        repo.show_all_trailers(args.ref)
     else:
-        show_all_trailers()
+        repo.show_all_trailers(args.ref)
 
 
 if __name__ == "__main__":
