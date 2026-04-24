@@ -14,7 +14,7 @@ git-plop aim [remote-branch]
 
         <namespace>/<trimmed-message>-<shortcode>
 
-    <namespace> is determined by either looking in git config for plop.remote_namespace or using
+    <namespace> is determined by either looking in git config for plop.branch_namespace or using
     the current username.
     <trimmed-message> is determined by taking the first 12 alphanumeric characters of the commit
     message. Non-alphanumeric characters are replaced with dashes.
@@ -35,6 +35,23 @@ git-plop lob [remote [ref]]
 
 import re
 import subprocess
+import sys
+
+TRAILER_KEY = "X-Dest-Branch"
+BASE32_ALPHABET = "23456789abcdefghijkmnopqrstvwxyz"
+BRANCH_NAME_LEN = 12
+
+
+def trim_message(message):
+    subject = message.split("\n", 1)[0]
+    subject = "".join([ch.lower() if ch.isalnum() else "-" for ch in subject])
+    return subject[:BRANCH_NAME_LEN].rstrip("-")
+
+
+def generate_shortcode():
+    with open("/dev/urandom", "rb") as f:
+        raw = f.read(6)
+    return "".join(BASE32_ALPHABET[b % 32] for b in raw)
 
 
 class Repo:
@@ -118,12 +135,129 @@ class Repo:
         for line in trailers:
             m = pattern.match(line)
             if m:
-                print(m.group(1))
+                return m.group(1)
+        return None
 
-    def show_all_trailers(self, ref):
-        _, msg = self.read_commit(ref)
-        trailers = self.parse_trailers(msg)
-        if trailers:
-            print("\n".join(trailers))
+    def generate_branch_name(self):
+        _, body = self.read_commit("HEAD")
+        try:
+            namespace = self.run(["config", "plop.branch_namespace"]).strip()
+        except subprocess.CalledProcessError:
+            try:
+                namespace = subprocess.check_output(["whoami"], text=True).strip()
+            except subprocess.CalledProcessError:
+                raise SystemExit("error: plop.branch_namespace not set and whoami failed")
+
+        trimmed = trim_message(body)
+        if trimmed:
+            trimmed += "-"
+        shortcode = generate_shortcode()
+        return f"{namespace}/{trimmed}{shortcode}"
+
+    def get_default_remote(self):
+        try:
+            branch = self.run(["symbolic-ref", "--short", "HEAD"]).strip()
+        except subprocess.CalledProcessError:
+            branch = None
+        else:
+            try:
+                return self.run(["config", f"branch.{branch}.pushRemote"]).strip()
+            except subprocess.CalledProcessError:
+                pass
+
+        try:
+            return self.run(["config", "remote.pushDefault"]).strip()
+        except subprocess.CalledProcessError:
+            pass
+
+        if branch:
+            try:
+                return self.run(["config", f"branch.{branch}.remote"]).strip()
+            except subprocess.CalledProcessError:
+                pass
+
+        raise SystemExit("error: could not determine remote; specify one explicitly")
+
+    def get_merge_base_ref(self, remote):
+        try:
+            branch = self.run(["symbolic-ref", "--short", "HEAD"]).strip()
+            merge = self.run(["config", f"branch.{branch}.merge"]).strip()
+            branch_remote = self.run(["config", f"branch.{branch}.remote"]).strip()
+            if branch_remote == remote:
+                short = merge.removeprefix("refs/heads/")
+                return f"refs/remotes/{remote}/{short}"
+        except subprocess.CalledProcessError:
+            pass
+
+        try:
+            return repo.run(["symbolic-ref", f"refs/remotes/{remote}/HEAD"]).strip()
+        except subprocess.CalledProcessError:
+            pass
+
+        raise SystemExit("error: could not determine merge base from here")
+
+    def aim(self, remote_branch=None):
+        if remote_branch is None:
+            remote_branch = self.generate_branch_name()
+        self.set_trailer(TRAILER_KEY, remote_branch)
+        print(remote_branch)
+
+    def lob(self, remote=None, ref=None):
+        if ref is None:
+            ref = "HEAD"
+        if remote is None:
+            remote = self.get_default_remote()
+
+        base_ref = self.get_merge_base_ref(remote)
+        merge_base = self.run(["merge-base", base_ref, ref]).strip()
+
+        output = self.run(["rev-list", "--ancestry-path", "--reverse", f"{merge_base}..{ref}"])
+        commits = [c for c in output.splitlines() if c]
+
+        if not commits:
+            print("No commits found.", file=sys.stderr)
+            return
+
+        refspecs = []
+        for commit in commits:
+            dest = self.get_trailer(commit, TRAILER_KEY)
+            if dest:
+                refspecs.append(f"{commit}:refs/heads/{dest}")
+
+        if not refspecs:
+            print("No aimed commits found.", file=sys.stderr)
+            return
+
+        self.run(["push", "--atomic", "--force-with-lease", remote] + refspecs)
 
 
+def main():
+    args = sys.argv[1:]
+
+    if not args or "-h" in args or "--help" in args:
+        print(USAGE)
+        sys.exit(0)
+
+    repo = Repo()
+    repo.validate()
+
+    cmd = args[0]
+
+    if cmd == "aim":
+        remote_branch = args[1] if len(args) > 1 else None
+        aim(repo, remote_branch)
+        return
+
+    if cmd == "lob":
+        remote = args[1] if len(args) > 1 else None
+        ref = args[2] if len(args) > 2 else None
+        lob(repo, remote, ref)
+        return
+
+    print(f"Unknown command: {cmd}", file=sys.stderr)
+    print(USAGE, file=sys.stderr)
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
