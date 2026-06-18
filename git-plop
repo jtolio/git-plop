@@ -43,10 +43,10 @@ git-plop show [remote [ref]]
 
     This command simply shows what target branch each ref might get pushed to.
 
-git-plop note [remote [ref]]
+git-plop note [-r] [remote [ref]]
 
     This updates all pushable git refs that have a target branch to have a git-note indicating
-    what the target branch is.
+    what the target branch is. If [-r] is set, target branch notes are removed.
 
 git-plop align [remote]
 
@@ -445,14 +445,14 @@ class Repo:
             return ""
         raise RuntimeError(f"Unexpected failure (exit {result.returncode}): {result.stderr}")
 
-    def update_notes(self, remote=None, ref=None):
+    def update_notes(self, remote=None, ref=None, remove=False):
         _, _, commits = self.get_commits(remote=remote, ref=ref)
         for ref in commits:
             dest_branch = self.db.get_dest_branch(self, ref)
             old_notes = self.get_notes(ref)
             notes = "\n".join(note for note in old_notes.split("\n")
                               if not note.strip().startswith(TRAILER_KEY + "=")).strip()
-            if dest_branch:
+            if dest_branch and not remove:
                 notes += f"\n\n{TRAILER_KEY}={dest_branch}"
             if notes:
                 self.run(["notes", "add", "-f", "--stripspace", "-m", notes, ref],
@@ -642,9 +642,11 @@ def main():
         return
 
     if cmd == "note":
-        remote = args[1] if len(args) > 1 else None
-        ref = args[2] if len(args) > 2 else None
-        repo.update_notes(remote, ref)
+        remove = "-r" in args[1:]
+        left = [a for a in args[1:] if a != "-r"]
+        remote = left[0] if len(left) > 0 else None
+        ref = left[1] if len(left) > 1 else None
+        repo.update_notes(remote, ref, remove=remove)
         return
 
     if cmd == "align":
