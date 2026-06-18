@@ -14,11 +14,15 @@ git-plop aim [remote-branch]
 
         <namespace>/<trimmed-message>-<shortcode>
 
-    <namespace> is determined by either looking in git config for plop.branch_namespace or using
+    <namespace> is determined by either looking in git config for plop.branchnamespace or using
     the current username.
     <trimmed-message> is determined by taking the first 12 alphanumeric characters of the commit
     message. Non-alphanumeric characters are replaced with dashes.
     <shortcode> is 6 random base 32 digits from /dev/urandom.
+
+git-plop disarm
+
+    This command undoes git-plop aim for the current HEAD commit.
 
 git-plop lob [remote [ref]]
 
@@ -34,6 +38,15 @@ git-plop lob [remote [ref]]
 
     If remote is not specified, it defaults to the default remote that git push would use.
     If ref is not specified, it defaults to HEAD.
+
+git-plop show [remote [ref]]
+
+    This command simply shows what target branch each ref might get pushed to.
+
+git-plop note [remote [ref]]
+
+    This updates all pushable git refs that have a target branch to have a git-note indicating
+    what the target branch is.
 
 git-plop align [remote]
 
@@ -54,6 +67,7 @@ git-plop align [remote]
     If remote is not specified, it defaults to the default remote that git push would use.
 """
 
+import os
 import re
 import subprocess
 import sys
@@ -75,8 +89,53 @@ def generate_shortcode():
     return "".join(BASE32_ALPHABET[b % 32] for b in raw)
 
 
+class DB:
+    def get_dest_branch(self, repo, ref):
+        """Gets the dest branch for ref"""
+        raise NotImplementedError
+    def set_dest_branch(self, repo, branch):
+        """Sets HEAD's dest branch to be `branch`"""
+        raise NotImplementedError
+    def remove_dest_branch(self, repo):
+        self.set_dest_branch(repo, None)
+
+
+class GitTrailer(DB):
+    def get_dest_branch(self, repo, ref):
+        return repo.get_trailer(ref, TRAILER_KEY)
+    def set_dest_branch(self, repo, branch):
+        repo.set_trailer(TRAILER_KEY, branch)
+
+
+class AuthorTimestamp(DB):
+    def _dir(self, repo):
+        p = os.path.join(repo.run(["rev-parse", "--absolute-git-dir"]).strip(),
+                         "info", "git-plop", "dbt")
+        os.makedirs(p, exist_ok=True)
+        return p
+    def get_dest_branch(self, repo, ref):
+        ts = repo.run(["log", "-1", "--format=%at", ref]).strip()
+        p = os.path.join(self._dir(repo), ts)
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as fh:
+                return fh.read().strip()
+        return None
+    def set_dest_branch(self, repo, branch):
+        ts = repo.run(["log", "-1", "--format=%at", "HEAD"]).strip()
+        p = os.path.join(self._dir(repo), ts)
+        if branch:
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(branch)
+        elif os.path.exists(p):
+            os.remove(p)
+
+
+DEFAULT_DB = AuthorTimestamp
+
+
 class Repo:
-    def __init__(self, git_dir=None, work_dir=None):
+    def __init__(self, db_plugin, git_dir=None, work_dir=None):
+        self.db = db_plugin
         self.git_dir = git_dir
         self.work_dir = work_dir
 
@@ -113,11 +172,10 @@ class Repo:
         full = header + "\n\n" + body
         if full and not full.endswith("\n"):
             full += "\n"
-        result = self.run(
+        return self.run(
             ["hash-object", "-t", "commit", "-w", "--stdin"],
             input=full,
-        )
-        return result.strip()
+        ).strip()
 
     def update_head(self, new_commit):
         try:
@@ -167,21 +225,22 @@ class Repo:
                 return m.group(1)
         return None
 
+    def _get_namespace(self):
+        ns = self.run(["config", "--default", "", "plop.branchnamespace"]).strip()
+        if ns:
+            return ns
+        try:
+            return subprocess.check_output(["whoami"], text=True).strip()
+        except subprocess.CalledProcessError:
+            raise SystemExit("error: plop.branchnamespace not set and whoami failed")
+
     def generate_branch_name(self):
         _, body = self.read_commit("HEAD")
-        try:
-            namespace = self.run(["config", "plop.branch_namespace"]).strip()
-        except subprocess.CalledProcessError:
-            try:
-                namespace = subprocess.check_output(["whoami"], text=True).strip()
-            except subprocess.CalledProcessError:
-                raise SystemExit("error: plop.branch_namespace not set and whoami failed")
-
         trimmed = trim_message(body)
         if trimmed:
             trimmed += "-"
         shortcode = generate_shortcode()
-        return f"{namespace}/{trimmed}{shortcode}"
+        return f"{self._get_namespace()}/{trimmed}{shortcode}"
 
     def get_default_remote(self):
         try:
@@ -340,10 +399,13 @@ class Repo:
     def aim(self, remote_branch=None):
         if remote_branch is None:
             remote_branch = self.generate_branch_name()
-        self.set_trailer(TRAILER_KEY, remote_branch)
+        self.db.set_dest_branch(self, remote_branch)
         print(remote_branch)
 
-    def lob(self, remote=None, ref=None):
+    def disarm(self):
+        self.db.remove_dest_branch(self)
+
+    def get_commits(self, remote=None, ref=None):
         if ref is None:
             ref = "HEAD"
         if remote is None:
@@ -353,6 +415,10 @@ class Repo:
         merge_base = self.run(["merge-base", base_ref, ref]).strip()
 
         commits = self.find_unique_path(merge_base, ref)
+        return (remote, ref, commits)
+
+    def lob(self, remote=None, ref=None):
+        remote, ref, commits = self.get_commits(remote=remote, ref=ref)
 
         if not commits:
             print("No commits found.", file=sys.stderr)
@@ -360,7 +426,7 @@ class Repo:
 
         refspecs = []
         for commit in commits:
-            dest = self.get_trailer(commit, TRAILER_KEY)
+            dest = self.db.get_dest_branch(self, commit)
             if dest:
                 refspecs.append(f"{commit}:refs/heads/{dest}")
 
@@ -369,6 +435,30 @@ class Repo:
             return
 
         self.run(["push", "--atomic", "--force-with-lease", remote] + refspecs)
+
+    def get_notes(self, ref):
+        cmd = self._git_cmd(["git", "notes", "show", ref])
+        result = subprocess.run(cmd, text=True, capture_output=True)
+        if result.returncode == 0: return result.stdout.strip()
+        if (result.returncode == 1 and
+            result.stderr.strip().startswith("error: no note found for object")):
+            return ""
+        raise RuntimeError(f"Unexpected failure (exit {result.returncode}): {result.stderr}")
+
+    def update_notes(self, remote=None, ref=None):
+        _, _, commits = self.get_commits(remote=remote, ref=ref)
+        for ref in commits:
+            dest_branch = self.db.get_dest_branch(self, ref)
+            old_notes = self.get_notes(ref)
+            notes = "\n".join(note for note in old_notes.split("\n")
+                              if not note.strip().startswith(TRAILER_KEY + "=")).strip()
+            if dest_branch:
+                notes += f"\n\n{TRAILER_KEY}={dest_branch}"
+            if notes:
+                self.run(["notes", "add", "-f", "--stripspace", "-m", notes, ref],
+                         stderr=subprocess.STDOUT)
+            elif old_notes:
+                self.run(["notes", "remove", ref], stderr=subprocess.STDOUT)
 
     def align(self, remote=None):
         if remote is None:
@@ -387,7 +477,7 @@ class Repo:
         # Collect dest branches from A commits (in order)
         a_branches = []
         for commit in a_commits:
-            dest = self.get_trailer(commit, TRAILER_KEY)
+            dest = self.db.get_dest_branch(self, commit)
             if dest:
                 a_branches.append((commit, dest))
 
@@ -409,7 +499,7 @@ class Repo:
                 continue
 
             # B HEAD: the submodule's actual current commit
-            sub_repo = Repo(work_dir=toplevel + "/" + sub_path)
+            sub_repo = Repo(self.db, work_dir=toplevel + "/" + sub_path)
             b_head = sub_repo.run(["rev-parse", "HEAD"]).strip()
 
             # B latest committed:
@@ -425,7 +515,7 @@ class Repo:
             # Collect dest branches from B commits (in order)
             b_branches = []
             for commit in b_commits:
-                dest = sub_repo.get_trailer(commit, TRAILER_KEY)
+                dest = sub_repo.db.get_dest_branch(sub_repo, commit)
                 if dest:
                     b_branches.append((commit, dest))
 
@@ -458,7 +548,7 @@ class Repo:
             b_pointer = b0
             targets = {}
             for commit in a_commits:
-                dest = self.get_trailer(commit, TRAILER_KEY)
+                dest = self.db.get_dest_branch(self, commit)
                 if dest and dest in shared:
                     b_pointer = b_branch_to_commit[dest]
                 targets[commit] = b_pointer
@@ -523,7 +613,7 @@ def main():
         print(USAGE)
         sys.exit(0)
 
-    repo = Repo()
+    repo = Repo(DEFAULT_DB())
     repo.validate()
 
     cmd = args[0]
@@ -533,10 +623,28 @@ def main():
         repo.aim(remote_branch)
         return
 
+    if cmd == "disarm":
+        repo.disarm()
+        return
+
     if cmd == "lob":
         remote = args[1] if len(args) > 1 else None
         ref = args[2] if len(args) > 2 else None
         repo.lob(remote, ref)
+        return
+
+    if cmd == "show":
+        remote = args[1] if len(args) > 1 else None
+        ref = args[2] if len(args) > 2 else None
+        _, _, commits = repo.get_commits(remote=remote, ref=ref)
+        for ref in commits:
+            print(ref, repo.db.get_dest_branch(repo, ref))
+        return
+
+    if cmd == "note":
+        remote = args[1] if len(args) > 1 else None
+        ref = args[2] if len(args) > 2 else None
+        repo.update_notes(remote, ref)
         return
 
     if cmd == "align":
