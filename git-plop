@@ -63,7 +63,7 @@ git-plop unmerged [remote [ref]]
 
 git-plop lob [remote [ref]]
 
-    For each commit in the unmerged set, this command considers whether it has been aimed. If not,
+    For each commit in the unmerged set, this command considers whether it has been aimed. If so,
     it adds it to a refspec to push to the remote with --atomic and --force-with-lease.
     This will update the specified remote branch for every commit that is found to have a
     destination. No other refs besides aimed refs are pushed.
