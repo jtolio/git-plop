@@ -117,8 +117,6 @@ class Repo:
 
     def run(self, args, check_returncode=True, capture_output=True, **kwargs):
         cmd = ["git"] + args
-        if args[0] in ("push", "hash-object", "update-ref", "mktree"):
-            print(cmd, file=sys.stderr)
         result = subprocess.run(cmd, cwd=self.work_dir, text=True, capture_output=capture_output,
                                 **kwargs)
         if check_returncode:
