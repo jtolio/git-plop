@@ -13,9 +13,8 @@ second.
 git-plop keeps a small database in the current repo's .git/info/plop/ (overridable with
 git config plop.db-path) which includes mappings of change ids to target branches.
 
-git-plop aim
-git-plop aim --all [remote [ref]]
 git-plop aim [ref [ref [ref ...]]]
+git-plop aim --all [remote [ref]]
 git-plop aim [ref] -t target-branch
 
     This command sets the target branch of a particular ref in the plop database.
@@ -38,7 +37,6 @@ git-plop aim [ref] -t target-branch
     message. Non-alphanumeric characters are replaced with dashes.
     <shortcode> is 6 random base 32 digits from /dev/urandom.
 
-git-plop disarm
 git-plop disarm [ref [ref [ref ...]]]
 
     This command undoes git-plop aim for the given refs, defaulting to HEAD if none are given.
