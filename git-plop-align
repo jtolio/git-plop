@@ -25,114 +25,26 @@ import sys
 
 
 class Repo:
-    def __init__(self, git_dir=None, work_dir=None):
-        self.git_dir = git_dir
+    def __init__(self, work_dir=None):
         self.work_dir = work_dir
 
-    def _git_cmd(self, base_cmd):
-        result = [base_cmd[0]]
-        if self.work_dir is not None:
-            result += ["-C", self.work_dir]
-        if self.git_dir is not None:
-            result += ["--git-dir", self.git_dir]
-        result += base_cmd[1:]
-        return result
-
     def run(self, args, check_returncode=True, capture_output=True, **kwargs):
-        cmd = self._git_cmd(["git"] + args)
+        cmd = ["git"] + args
         if args[0] in ("push", "hash-object", "update-ref", "mktree"):
             print(cmd, file=sys.stderr)
-        result = subprocess.run(cmd, text=True, capture_output=capture_output, **kwargs)
+        result = subprocess.run(cmd, cwd=self.work_dir, text=True, capture_output=capture_output,
+                                **kwargs)
         if check_returncode:
             result.check_returncode()
         return result
-
-    def read_commit(self, ref):
-        header, _, body = self.run(["cat-file", "-p", ref]).stdout.partition("\n\n")
-        return header, body
 
     def validate(self):
         self.run(["rev-parse", "--git-dir"])
         self.run(["rev-parse", "HEAD"])
 
-    def get_default_remote(self):
-        try:
-            branch = self.run(["symbolic-ref", "--short", "HEAD"]).stdout.strip()
-        except subprocess.CalledProcessError:
-            branch = None
-        else:
-            try:
-                return self.run(["config", f"branch.{branch}.pushRemote"]).stdout.strip()
-            except subprocess.CalledProcessError:
-                pass
-
-        try:
-            return self.run(["config", "remote.pushDefault"]).stdout.strip()
-        except subprocess.CalledProcessError:
-            pass
-
-        if branch:
-            try:
-                return self.run(["config", f"branch.{branch}.remote"]).stdout.strip()
-            except subprocess.CalledProcessError:
-                pass
-
-        raise SystemExit("error: could not determine remote; specify one explicitly")
-
-    def get_merge_base_ref(self, remote):
-        try:
-            branch = self.run(["symbolic-ref", "--short", "HEAD"]).stdout.strip()
-            merge = self.run(["config", f"branch.{branch}.merge"]).stdout.strip()
-            branch_remote = self.run(["config", f"branch.{branch}.remote"]).stdout.strip()
-            if branch_remote == remote:
-                short = merge.removeprefix("refs/heads/")
-                return f"refs/remotes/{remote}/{short}"
-        except subprocess.CalledProcessError:
-            pass
-
-        try:
-            return self.run(["symbolic-ref", f"refs/remotes/{remote}/HEAD"]).stdout.strip()
-        except subprocess.CalledProcessError:
-            pass
-
-        raise SystemExit("error: could not determine merge base from here")
-
-    def find_unique_path(self, start, end):
-        start_hash = self.run(["rev-parse", start]).stdout.strip()
-        end_hash = self.run(["rev-parse", end]).stdout.strip()
-        if start_hash == end_hash: return []
-
-        try:
-            output = self.run(
-                ["rev-list", "--ancestry-path", "--parents",
-                 f"{start_hash}..{end_hash}"]
-            ).stdout
-        except subprocess.CalledProcessError:
-            raise SystemExit(
-                f"error: no path found from {start_hash[:12]} to {end_hash[:12]}")
-
-        ancestors = {}
-        for line in output.splitlines():
-            if not line.strip():
-                continue
-            parts = line.split()
-            commit = parts[0]
-            parents = parts[1:]
-            if len(parents) > 1:
-                raise SystemExit("merge commit rejected")
-            ancestors[commit] = parents[0]
-
-        node = end_hash
-        path = []
-        while node != start_hash:
-            path.append(node)
-            node = ancestors[node]
-
-        return list(reversed(path))
-
-    def lookup(self, ref=None):
-        if ref is None: ref = "HEAD"
-        return self.run(["plop", "lookup", ref]).stdout.strip()
+    def read_commit(self, ref):
+        header, _, body = self.run(["cat-file", "-p", ref]).stdout.partition("\n\n")
+        return header, body
 
     def write_commit_object(self, header, body):
         full = header + "\n\n" + body
@@ -146,7 +58,7 @@ class Repo:
     def update_head(self, new_commit):
         try:
             symref = self.run(["symbolic-ref", "-q", "HEAD"])
-        except:
+        except subprocess.CalledProcessError:
             self.run(["update-ref", "HEAD", new_commit])
         else:
             self.run(["update-ref", symref.stdout.strip(), new_commit])
@@ -231,23 +143,22 @@ class Repo:
         return meta.split()[2]
 
     def align(self, remote=None):
-        if remote is None:
-            remote = self.get_default_remote()
-
-        # Find merge base of outer repo
-        base_ref = self.get_merge_base_ref(remote)
-        merge_base = self.run(["merge-base", base_ref, "HEAD"]).stdout.strip()
-
         # Get unique path from merge-base to HEAD
-        a_commits = self.find_unique_path(merge_base, "HEAD")
+        a_commits = self.run(
+            ["plop", "unmerged"] + ([remote] if remote is not None else [])).stdout.splitlines()
         if not a_commits:
             print("No commits to align.", file=sys.stderr)
             return
 
+        # The merge-base is the parent of the oldest unmerged commit: plop
+        # unmerged returns a unique linear path (no merges) from the merge-base
+        # (exclusive) to HEAD, oldest-first.
+        merge_base = self.run(["rev-parse", a_commits[0] + "^"]).stdout.strip()
+
         # Collect dest branches from A commits (in order)
         a_branches = []
         for commit in a_commits:
-            dest = self.lookup(commit)
+            dest = self.run(["plop", "lookup", commit]).stdout.strip()
             if dest:
                 a_branches.append((commit, dest))
 
@@ -269,23 +180,22 @@ class Repo:
                 continue
 
             # B HEAD: the submodule's actual current commit
-            sub_repo = Repo(self.db, work_dir=toplevel + "/" + sub_path)
+            sub_repo = Repo(work_dir=toplevel + "/" + sub_path)
             b_head = sub_repo.run(["rev-parse", "HEAD"]).stdout.strip()
-
-            # B latest committed:
-            b_remote = sub_repo.get_merge_base_ref(remote)
 
             if b0 == b_head:
                 continue
 
-            b_commits = sub_repo.find_unique_path(b_remote, b_head)
+            # The submodule is an independent repo: let plop default to the
+            # submodule's own remote and HEAD (which is b_head).
+            b_commits = sub_repo.run(["plop", "unmerged"]).stdout.splitlines()
             if not b_commits:
                 continue
 
             # Collect dest branches from B commits (in order)
             b_branches = []
             for commit in b_commits:
-                dest = sub_repo.lookup(commit)
+                dest = sub_repo.run(["plop", "lookup", commit]).stdout.strip()
                 if dest:
                     b_branches.append((commit, dest))
 
@@ -318,7 +228,7 @@ class Repo:
             b_pointer = b0
             targets = {}
             for commit in a_commits:
-                dest = self.lookup(commit)
+                dest = self.run(["plop", "lookup", commit]).stdout.strip()
                 if dest and dest in shared:
                     b_pointer = b_branch_to_commit[dest]
                 targets[commit] = b_pointer
@@ -334,7 +244,20 @@ class Repo:
             header_lines = header.splitlines()
             tree_hash = None
             new_header_lines = []
+            dropped_gpgsig = False
+            in_gpgsig = False
             for line in header_lines:
+                # A gpgsig header spans multiple lines; continuation lines
+                # begin with a space. Rewriting the tree/parent invalidates
+                # the signature, so drop the whole block.
+                if in_gpgsig:
+                    if line.startswith(" "):
+                        continue
+                    in_gpgsig = False
+                if line.startswith("gpgsig ") or line.startswith("gpgsig-"):
+                    dropped_gpgsig = True
+                    in_gpgsig = True
+                    continue
                 if line.startswith("tree "):
                     tree_hash = line.split(" ", 1)[1]
                     new_header_lines.append(line)
@@ -363,6 +286,11 @@ class Repo:
             new_sha = self.write_commit_object(final_header, body)
             commit_map[commit] = new_sha
 
+            if dropped_gpgsig and new_sha != commit:
+                print(
+                    f"warning: dropped GPG signature from rewritten commit "
+                    f"{commit[:12]} (now {new_sha[:12]})", file=sys.stderr)
+
         # Update HEAD if anything changed
         last_old = a_commits[-1]
         last_new = commit_map[last_old]
@@ -385,12 +313,12 @@ def main():
     args = sys.argv[1:]
 
     if not args or "-h" in args or "--help" in args:
-        return usage(0)
+        usage(0)
 
     repo = Repo()
     repo.validate()
 
-    if len(args) > 1: return usage()
+    if len(args) > 1: usage()
     return repo.align(remote=(args[0] if len(args) == 1 else None))
 
 

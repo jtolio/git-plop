@@ -13,19 +13,22 @@ second.
 git-plop keeps a small database in .git/info/plop/ which includes mappings of change ids to target
 branches.
 
-git-plop aim [ref] [remote-branch]
+git-plop aim
+git-plop aim --all [remote [ref]]
+git-plop aim [ref [ref [ref ...]]]
+git-plop aim [ref] -t target-branch
 
     This command sets the target branch of a particular ref in the plop database.
 
-    If no arguments are provided, it generates a remote branch name and sets it for HEAD.
-    If one argument is provided, it is evaluated to see if it already references anything.
-        If the one argument does reference something, it is assumed to be 'ref', and a remote
-        branch is synthesized and set.
-        If the argument does not reference something in the repo already, then the argument is
-        assumed to be 'remote-branch' and HEAD is set to it.
-    If two arguments are provided, the command is fully specified.
+    If no arguments are provided, it generates a target branch name and sets it for HEAD if HEAD
+    does not already have one.
+    If --all is provided, then all unmerged commits are aimed with a synthetic branch if they don't
+    already have one. See git-plop unmerged.
+    If one or more arguments are provided without -t, each argument is set to a new synthetic
+    target branch if one does not exist.
+    If -t is provided, then the given ref (or HEAD, if none is given) is set to the given branch.
 
-    If remote-branch is not specified, it is generated with the following format:
+    If target-branch is not specified, it is generated with the following format:
 
         <namespace>/<trimmed-message>-<shortcode>
 
@@ -35,48 +38,56 @@ git-plop aim [ref] [remote-branch]
     message. Non-alphanumeric characters are replaced with dashes.
     <shortcode> is 6 random base 32 digits from /dev/urandom.
 
-git-plop disarm [ref]
+git-plop disarm
+git-plop disarm [ref [ref [ref ...]]]
 
-    This command undoes git-plop aim for ref, defaulting to HEAD.
+    This command undoes git-plop aim for the given refs, defaulting to HEAD if none are given.
 
-git-plop lob [remote [ref]]
+git-plop id [ref]
 
-    This command looks at the ref, finds the merge-base of ref and the current remote tracking
-    branch (or the default branch on the remote if no tracking branch is found), and then, for each
-    commit in that chain, considers whether it has been aimed.
+    This command shows the git-plop change id for the ref, defaulting to HEAD.
 
-    A single refspec is generated that is pushed to the remote with --atomic and --force-with-lease
-    that updates the specified remote branch for every commit that is found to have the trailer.
-    No other refs besides aimed refs are pushed.
+git-plop lookup [ref]
 
+    This command shows the git-plop destination branch for the ref, defaulting to HEAD.
+
+git-plop unmerged [remote [ref]]
+
+    This command shows all commits that are currently unmerged to the remote branch. It does this
+    by looking at the ref, finding the merge-base of ref and the current remote tracking
+    branch (or the default branch on the remote if no tracking branch is found), and then looking
+    at that chain.
     The commit chain from merge-base to ref must be a unique linear path. If multiple paths
     exist, an error is raised.
 
     If remote is not specified, it defaults to the default remote that git push would use.
     If ref is not specified, it defaults to HEAD.
 
-git-plop id [ref]
+git-plop lob [remote [ref]]
 
-    This command shows the git-plop change id for the ref.
+    For each commit in the unmerged set, this command considers whether it has been aimed. If not,
+    it adds it to a refspec to push to the remote with --atomic and --force-with-lease.
+    This will update the specified remote branch for every commit that is found to have a
+    destination. No other refs besides aimed refs are pushed.
 
-git-plop lookup [ref]
+git-plop log [remote [ref]]
 
-    This command shows the git-plop destination branch for the ref.
-
-git-plop show [remote [ref]]
-
-    This command simply shows what target branch each ref might get pushed to.
+    This command shows the current unmerged commits along with their change ids and destination
+    branches.
 
 git-plop branch [-r] [remote [ref]]
 
     For better usability with other tools, this tool will make or update local git-plop branches in
     a 'plop/' branch namespace for every aimed git commit in the local database. If [-r] is set,
     target branch annotations are removed.
+
+git-plop clean
+
+    Removes all git-plop data.
 """
 
 import base64
 import hashlib
-import hmac
 import os
 import subprocess
 import sys
@@ -92,41 +103,35 @@ def trim_message(message):
 
 
 def generate_shortcode():
-    with open("/dev/urandom", "rb") as f:
-        raw = f.read(SHORTCODE_LEN)
+    raw = os.urandom(SHORTCODE_LEN)
     return base64.b32encode(raw).decode("utf-8").lower().rstrip("=")[:SHORTCODE_LEN]
 
 
 class Repo:
-    def __init__(self, git_dir=None, work_dir=None):
-        self.git_dir = git_dir
+    def __init__(self, work_dir=None):
         self.work_dir = work_dir
-
-    def _git_cmd(self, base_cmd):
-        result = [base_cmd[0]]
-        if self.work_dir is not None:
-            result += ["-C", self.work_dir]
-        if self.git_dir is not None:
-            result += ["--git-dir", self.git_dir]
-        result += base_cmd[1:]
-        return result
+        self.db_dir = os.path.join(
+            self.run(["rev-parse", "--absolute-git-dir"]).stdout.strip(),
+            "info", "plop", "dbc")
+        os.makedirs(self.db_dir, exist_ok=True)
 
     def run(self, args, check_returncode=True, capture_output=True, **kwargs):
-        cmd = self._git_cmd(["git"] + args)
+        cmd = ["git"] + args
         if args[0] in ("push", "hash-object", "update-ref", "mktree"):
             print(cmd, file=sys.stderr)
-        result = subprocess.run(cmd, text=True, capture_output=capture_output, **kwargs)
+        result = subprocess.run(cmd, cwd=self.work_dir, text=True, capture_output=capture_output,
+                                **kwargs)
         if check_returncode:
             result.check_returncode()
         return result
 
-    def read_commit(self, ref):
-        header, _, body = self.run(["cat-file", "-p", ref]).stdout.partition("\n\n")
-        return header, body
-
     def validate(self):
         self.run(["rev-parse", "--git-dir"])
         self.run(["rev-parse", "HEAD"])
+
+    def read_commit(self, ref):
+        header, _, body = self.run(["cat-file", "-p", ref]).stdout.partition("\n\n")
+        return header, body
 
     def change_id(self, ref=None):
         if ref is None: ref = "HEAD"
@@ -134,18 +139,8 @@ class Repo:
         author = [l for l in header.splitlines() if l.startswith("author ")]
         if len(author) != 1:
             raise SystemExit("error: author information not found in commit %r" % ref)
-        h = hmac.new("plop-id".encode("utf-8"), author[0].encode("utf-8"), hashlib.sha256)
+        h = hashlib.sha256(("plop-id " + author[0]).encode("utf-8"))
         return base64.b32encode(h.digest())[:20].decode("utf-8").lower()
-
-    def db_dir(self):
-        p = os.path.join(self.run(["rev-parse", "--absolute-git-dir"]).stdout.strip(),
-                         "info", "plop", "dbt")
-        os.makedirs(p, exist_ok=True)
-        return p
-
-    def has_ref(self, ref):
-        result = self.run(["rev-parse", "--verify", ref], check_returncode=False)
-        return result.returncode == 0
 
     def get_namespace(self):
         ns = self.run(["config", "--default", "", "plop.branch-namespace"]).stdout.strip()
@@ -230,40 +225,60 @@ class Repo:
                 raise SystemExit("merge commit rejected")
             ancestors[commit] = parents[0]
 
+        # An empty result (rev-list exits 0 with no output) means end is not a
+        # descendant of start at all.
+        if not ancestors:
+            raise SystemExit(
+                f"error: no path found from {start_hash[:12]} to {end_hash[:12]}")
+
         node = end_hash
         path = []
         while node != start_hash:
+            if node not in ancestors:
+                raise SystemExit(
+                    f"error: no unique linear path from {start_hash[:12]} to "
+                    f"{end_hash[:12]} (chain broken at {node[:12]})")
             path.append(node)
             node = ancestors[node]
 
         return list(reversed(path))
 
+    def lookup_by_change(self, change_id):
+        p = os.path.join(self.db_dir, change_id)
+        if not os.path.exists(p): return ""
+        with open(p, encoding="utf-8") as fh:
+            return fh.read().strip()
+
+    def lookup(self, ref=None):
+        if ref is None: ref = "HEAD"
+        return self.lookup_by_change(self.change_id(ref))
+
+    def validate_branch_name(self, target):
+        if target == "_":
+            raise SystemExit("invalid target branch %r" % target)
+        self.run(["check-ref-format", f"refs/heads/{target}"])
+
     def aim(self, ref=None, target=None):
         if ref is None: ref = "HEAD"
-        if target is None: target = self.generate_branch_name()
         change_id = self.change_id(ref)
-        p = os.path.join(self.db_dir(), change_id)
+        if target is None:
+            if self.lookup_by_change(change_id): return
+            target = self.generate_branch_name()
+        self.validate_branch_name(target)
+        p = os.path.join(self.db_dir, change_id)
         with open(p, "w", encoding="utf-8") as fh:
             fh.write(target)
         print("%s -> %s" % (change_id, target))
 
-    def lookup(self, ref=None):
-        if ref is None: ref = "HEAD"
-        change_id = self.change_id(ref)
-        p = os.path.join(self.db_dir(), change_id)
-        if not os.path.exists(p): return ""
-        with open(p, encoding="utf-8") as fh:
-            return fh.read()
-
     def disarm(self, ref=None):
         if ref is None: ref = "HEAD"
         change_id = self.change_id(ref)
-        p = os.path.join(self.db_dir(), change_id)
+        p = os.path.join(self.db_dir, change_id)
         if not os.path.exists(p): return
         os.remove(p)
-        print("%s -> _" % ref)
+        print("%s -> _" % change_id)
 
-    def get_commits(self, remote=None, ref=None):
+    def unmerged(self, remote=None, ref=None):
         if ref is None:
             ref = "HEAD"
         if remote is None:
@@ -276,7 +291,7 @@ class Repo:
         return (remote, ref, commits)
 
     def lob(self, remote=None, ref=None):
-        remote, ref, commits = self.get_commits(remote=remote, ref=ref)
+        remote, ref, commits = self.unmerged(remote=remote, ref=ref)
 
         if not commits:
             print("No commits found.", file=sys.stderr)
@@ -303,11 +318,11 @@ class Repo:
             if remove or branch != "refs/heads/plop/" + self.lookup(branch):
                 self.run(["update-ref", "-d", branch])
         if remove: return
-        remote, ref, commits = self.get_commits(remote=remote, ref=ref)
-        for ref in commits:
-            target = self.lookup(ref)
+        _, _, commits = self.unmerged(remote=remote, ref=ref)
+        for commit in commits:
+            target = self.lookup(commit)
             if target:
-                self.run(["update-ref", "refs/heads/plop/" + target, ref])
+                self.run(["update-ref", "refs/heads/plop/" + target, commit])
 
 
 def usage(c=1):
@@ -319,67 +334,96 @@ def main():
     args = sys.argv[1:]
 
     if not args or "-h" in args or "--help" in args:
-        return usage(0)
+        usage(0)
 
     repo = Repo()
     repo.validate()
 
     cmd, args = args[0], args[1:]
 
-    if cmd == "aim":
-        if len(args) > 2: return usage()
-        if len(args) == 2:
-            return repo.aim(ref=args[0], target=args[1])
+    def remote_ref(args):
+        if len(args) == 0:
+            return None, None
         if len(args) == 1:
-            if repo.has_ref(args[0]):
-                return repo.aim(ref=args[0])
-            return repo.aim(target=args[0])
-        return repo.aim()
+            return args[0], None
+        if len(args) == 2:
+            return args[0], args[1]
+        usage()
+
+    if cmd == "aim":
+        if "--all" in args:
+            if args[0] != "--all": usage()
+            _, _, refs = repo.unmerged(*remote_ref(args[1:]))
+            for ref in refs:
+                repo.aim(ref=ref)
+            return
+        if "-t" in args:
+            if len(args) == 2:
+                if args[0] != "-t": usage()
+                return repo.aim(target=args[1])
+            if len(args) == 3:
+                if args[1] != "-t": usage()
+                return repo.aim(ref=args[0], target=args[2])
+            usage()
+        if len(args) == 0: return repo.aim()
+        for ref in args:
+            repo.aim(ref=ref)
+        return
 
     if cmd == "disarm":
-        if len(args) > 1: return usage()
-        return repo.disarm(ref=(args[0] if len(args) == 1 else None))
-
-    if cmd == "lob":
-        if len(args) > 2: return usage()
-        remote = args[0] if len(args) >= 1 else None
-        ref = args[1] if len(args) == 2 else None
-        return repo.lob(remote=remote, ref=ref)
+        if len(args) == 0: return repo.disarm()
+        for ref in args:
+            repo.disarm(ref=ref)
+        return
 
     if cmd == "id":
-        if len(args) > 1: return usage()
+        if len(args) > 1: usage()
         print(repo.change_id(ref=(args[0] if len(args) == 1 else None)))
         return
 
     if cmd == "lookup":
-        if len(args) > 1: return usage()
+        if len(args) > 1: usage()
         target = repo.lookup(ref=(args[0] if len(args) == 1 else None))
         if target: print(target)
         return
 
-    if cmd == "show":
-        if len(args) > 2: return usage()
-        remote = args[0] if len(args) >= 1 else None
-        ref = args[1] if len(args) == 2 else None
-        _, _, commits = repo.get_commits(remote=remote, ref=ref)
-        for ref in commits:
-            print("%s -> %s" % (ref, repo.lookup(ref) or "_"))
+    if cmd == "unmerged":
+        _, _, refs = repo.unmerged(*remote_ref(args))
+        for ref in refs:
+            print(ref)
+        return
+
+    if cmd == "lob":
+        return repo.lob(*remote_ref(args))
+
+    if cmd == "log":
+        _, _, refs = repo.unmerged(*remote_ref(args))
+        for ref in refs:
+            change_id = repo.change_id(ref)
+            target = repo.lookup_by_change(change_id)
+            print("%s\t%s\t%s" % (ref, change_id, target or "_"))
         return
 
     if cmd == "branch":
-        remove, rest = "-r" in args, [a for a in args if a != "-r"]
-        if remove and len(args) > 3: return usage()
-        if not remove and len(args) > 2: return usage()
-        remote = rest[0] if len(rest) >= 1 else None
-        ref = rest[1] if len(rest) >= 2 else None
+        remove = False
+        if "-r" in args:
+            remove = True
+            if args[0] == "-r":
+                args = args[1:]
+            elif args[-1] == "-r":
+                args = args[:-1]
+            else:
+                usage()
+        remote, ref = remote_ref(args)
         return repo.update_branches(remote=remote, ref=ref, remove=remove)
 
-    if cmd == "align":
-        if len(args) > 1: return usage()
-        return repo.align(remote=(args[0] if len(args) == 1 else None))
+    if cmd == "clean":
+        if len(args) > 0: usage()
+        repo.update_branches(remove=True)
+        shutil.rmtree(os.repo.db_dir)
 
     print(f"Unknown command: {cmd}", file=sys.stderr)
-    return usage()
+    usage()
 
 
 if __name__ == "__main__":
