@@ -10,8 +10,8 @@ commit rarely changes across rebases or cherry-picks, and authors rarely commit 
 second. Note that git-plop will behave strangely if a particular author commits more than once a
 second.
 
-git-plop keeps a small database in .git/info/plop/ which includes mappings of change ids to target
-branches.
+git-plop keeps a small database in the current repo's .git/info/plop/ (overridable with
+git config plop.db-path) which includes mappings of change ids to target branches.
 
 git-plop aim
 git-plop aim --all [remote [ref]]
@@ -110,9 +110,11 @@ def generate_shortcode():
 class Repo:
     def __init__(self, work_dir=None):
         self.work_dir = work_dir
-        self.db_dir = os.path.join(
-            self.run(["rev-parse", "--absolute-git-dir"]).stdout.strip(),
-            "info", "plop", "dbc")
+        path_root = self.run(["config", "--default", "", "plop.db-path"]).stdout.strip()
+        if not path_root:
+            path_root = os.path.join(
+                self.run(["rev-parse", "--absolute-git-dir"]).stdout.strip(), "info", "plop")
+        self.db_dir = os.path.join(path_root, "dbc")
         os.makedirs(self.db_dir, exist_ok=True)
 
     def run(self, args, check_returncode=True, capture_output=True, **kwargs):
