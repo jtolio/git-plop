@@ -14,7 +14,7 @@ git-plop keeps a small database in the current repo's .git/info/plop/ (overridab
 git config plop.db-path) which includes mappings of change ids to target branches.
 
 git-plop aim [ref [ref [ref ...]]]
-git-plop aim --all [remote [ref]]
+git-plop aim --all [-r remote] [ref]
 git-plop aim [ref] -t target-branch
 
     This command sets the target branch of a particular ref in the plop database.
@@ -49,7 +49,7 @@ git-plop lookup [ref]
 
     This command shows the git-plop destination branch for the ref, defaulting to HEAD.
 
-git-plop unmerged [remote [ref]]
+git-plop unmerged [-r remote] [ref]
 
     This command shows all commits on the current branch that are currently unmerged to the remote
     branch. It does this by looking at the ref, finding the merge-base of ref and the current remote
@@ -61,14 +61,14 @@ git-plop unmerged [remote [ref]]
     If remote is not specified, it defaults to the default remote that git push would use.
     If ref is not specified, it defaults to HEAD.
 
-git-plop lob [remote [ref]]
+git-plop lob [-r remote] [ref]
 
     For each commit in the unmerged set, this command considers whether it has been aimed. If so,
     it adds it to a refspec to push to the remote with --atomic and --force-with-lease.
     This will update the specified remote branch for every commit that is found to have a
     destination. No other refs besides aimed refs are pushed.
 
-git-plop log [remote [ref]]
+git-plop log [-r remote] [ref]
 
     This command shows the current unmerged commits along with their change ids and destination
     branches.
@@ -78,11 +78,10 @@ git-plop remote [remote]
     This command looks in the appropriate remote for all remote branches in your configured
     namespace (see 'git-plop aim' for namespace documentation). It then logs the tips of each.
 
-git-plop branch [-r] [remote [ref]]
+git-plop branch [-r remote] [ref]
 
     For better usability with other tools, this tool will make or update local git-plop branches in
-    a 'plop/' branch namespace for every aimed git commit in the local database. If [-r] is set,
-    target branch annotations are removed.
+    a 'plop/' branch namespace for every aimed git commit in the local database.
 
 git-plop fetch [remote]
 
@@ -90,6 +89,10 @@ git-plop fetch [remote]
     all remote branches in your configured namespace (see 'git-plop aim' for namespace
     documentation). Once it identifies remote branches in your namespace, it makes sure that those
     changes have all been aimed to those remote branches.
+
+git-plop unbranch
+
+    Removes branches from 'git-plop branch'
 
 git-plop clean
 
@@ -354,7 +357,7 @@ class Repo:
         prefix = f"{remote_prefix}{self.get_namespace()}/"
         branches = self.run(["for-each-ref", "--format=%(refname)", prefix]).stdout.splitlines()
         seen_changes = defaultdict(list)
-        for branch in set(branches):
+        for branch in sorted(set(branches)):
             if not branch.startswith(prefix): continue
             target = branch.removeprefix(remote_prefix)
             seen_changes[self.change_id(ref=branch)].append(target)
@@ -397,13 +400,22 @@ def main():
     cmd, args = args[0], args[1:]
 
     def remote_ref(args):
-        if len(args) == 0:
-            return None, None
-        if len(args) == 1:
-            return args[0], None
-        if len(args) == 2:
-            return args[0], args[1]
-        usage()
+        remote = None
+        ref = None
+        remote_flag = False
+        for arg in args:
+            if arg == "-r":
+                if remote_flag: usage()
+                remote_flag = True
+                continue
+            if remote_flag:
+                if remote is not None: usage()
+                remote = arg
+                remote_flag = False
+                continue
+            if ref is not None: usage()
+            ref = arg
+        return remote, ref
 
     def filter_flag(flag, args):
         return flag in args, [a for a in args if a != flag]
@@ -456,7 +468,7 @@ def main():
 
     if cmd == "log":
         _, _, refs = repo.unmerged(*remote_ref(args))
-        for ref in refs:
+        for ref in reversed(refs):
             repo.print_one(ref=ref)
         return
 
@@ -465,11 +477,10 @@ def main():
         return repo.show_remote(remote=(args[0] if len(args) == 1 else None))
 
     if cmd == "branch":
-        remove, args = filter_flag("-r", args)
-        if remove:
-            repo.clean_branches(remove_all=True)
-            return
         return repo.update_branches(*remote_ref(args))
+
+    if cmd == "unbranch":
+        return repo.clean_branches(remove_all=True)
 
     if cmd == "fetch":
         if len(args) > 1: usage()
