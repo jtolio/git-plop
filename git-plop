@@ -22,7 +22,7 @@ git-plop aim [ref] -t target-branch
     If no arguments are provided, it generates a target branch name and sets it for HEAD if HEAD
     does not already have one.
     If --all is provided, then all unmerged commits are aimed with a synthetic branch if they don't
-    already have one. See git-plop unmerged.
+    already have one. See 'git-plop unmerged'.
     If one or more arguments are provided without -t, each argument is set to a new synthetic
     target branch if one does not exist.
     If -t is provided, then the given ref (or HEAD, if none is given) is set to the given branch.
@@ -79,6 +79,14 @@ git-plop branch [-r] [remote [ref]]
     a 'plop/' branch namespace for every aimed git commit in the local database. If [-r] is set,
     target branch annotations are removed.
 
+git-plop fetch [remote] [-b]
+
+    This command runs `git fetch` against the appropriate remote, then looks in that remote for
+    all remote branches in your configured namespace (see 'git-plop aim' for namespace
+    documentation). Once it identifies remote branches in your namespace, it makes sure that those
+    changes have all been aimed to those remote branches.
+    If -b is provided, the equivalent of 'git-plop branch' is run on each synced ref.
+
 git-plop clean
 
     Removes all git-plop data.
@@ -87,6 +95,7 @@ git-plop clean
 import base64
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 
@@ -308,19 +317,35 @@ class Repo:
         self.run(["push", "--atomic", "--force-with-lease", remote] + refspecs,
                  capture_output=False)
 
-    def update_branches(self, remote=None, ref=None, remove=False):
+    def clean_branches(self, remove_all=False):
         local_branches = self.run([
             "for-each-ref", "--format=%(refname)", "refs/heads/plop/"]).stdout.splitlines()
         for branch in local_branches:
             if not branch.startswith("refs/heads/plop/"): continue
-            if remove or branch != "refs/heads/plop/" + self.lookup(branch):
+            if remove_all or branch != "refs/heads/plop/" + self.lookup(branch):
                 self.run(["update-ref", "-d", branch])
-        if remove: return
+
+    def update_branches(self, remote=None, ref=None):
+        self.clean_branches()
         _, _, commits = self.unmerged(remote=remote, ref=ref)
         for commit in commits:
             target = self.lookup(commit)
             if target:
                 self.run(["update-ref", "refs/heads/plop/" + target, commit])
+
+    def fetch(self, remote=None, update_branches=False):
+        if remote is None:
+            remote = self.get_default_remote()
+        self.run(["fetch", remote])
+        remote_prefix = f"refs/remotes/{remote}/"
+        prefix = f"{remote_prefix}{self.get_namespace()}/"
+        branches = self.run(["for-each-ref", "--format=%(refname)", prefix]).stdout.splitlines()
+        if update_branches: self.clean_branches()
+        for branch in branches:
+            if not branch.startswith(prefix): continue
+            target = branch.removeprefix(remote_prefix)
+            self.aim(ref=branch, target=target)
+            if update_branches: self.run(["update-ref", "refs/heads/plop/" + target, branch])
 
 
 def usage(c=1):
@@ -347,6 +372,9 @@ def main():
         if len(args) == 2:
             return args[0], args[1]
         usage()
+
+    def filter_flag(flag, args):
+        return flag in args, [a for a in args if a != flag]
 
     if cmd == "aim":
         if "--all" in args:
@@ -403,22 +431,22 @@ def main():
         return
 
     if cmd == "branch":
-        remove = False
-        if "-r" in args:
-            remove = True
-            if args[0] == "-r":
-                args = args[1:]
-            elif args[-1] == "-r":
-                args = args[:-1]
-            else:
-                usage()
-        remote, ref = remote_ref(args)
-        return repo.update_branches(remote=remote, ref=ref, remove=remove)
+        remove, args = filter_flag("-r", args)
+        if remove:
+            repo.clean_branches(remove_all=True)
+            return
+        return repo.update_branches(*remote_ref(args))
+
+    if cmd == "fetch":
+        branch, args = filter_flag("-b", args)
+        if len(args) > 1: usage()
+        return repo.fetch(remote=(args[0] if len(args) == 1 else None), update_branches=branch)
 
     if cmd == "clean":
         if len(args) > 0: usage()
-        repo.update_branches(remove=True)
-        shutil.rmtree(os.repo.db_dir)
+        repo.clean_branches(remove_all=True)
+        shutil.rmtree(repo.db_dir)
+        return
 
     print(f"Unknown command: {cmd}", file=sys.stderr)
     usage()
