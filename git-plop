@@ -350,7 +350,8 @@ class Repo:
         for commit in commits:
             target = self.lookup(commit)
             if target:
-                self.run(["update-ref", "refs/heads/plop/" + target, commit])
+                short = self.run(["rev-parse", "--short", commit]).stdout.strip()
+                self.run(["update-ref", f"refs/heads/plop/{target}/{short}", commit])
 
     def each_remote(self, for_each, remote):
         remote_prefix = f"refs/remotes/{remote}/"
