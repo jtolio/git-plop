@@ -51,10 +51,10 @@ git-plop lookup [ref]
 
 git-plop unmerged [remote [ref]]
 
-    This command shows all commits that are currently unmerged to the remote branch. It does this
-    by looking at the ref, finding the merge-base of ref and the current remote tracking
-    branch (or the default branch on the remote if no tracking branch is found), and then looking
-    at that chain.
+    This command shows all commits on the current branch that are currently unmerged to the remote
+    branch. It does this by looking at the ref, finding the merge-base of ref and the current remote
+    tracking branch (or the default branch on the remote if no tracking branch is found), and then
+    looking at that chain.
     The commit chain from merge-base to ref must be a unique linear path. If multiple paths
     exist, an error is raised.
 
@@ -72,6 +72,11 @@ git-plop log [remote [ref]]
 
     This command shows the current unmerged commits along with their change ids and destination
     branches.
+
+git-plop remote [remote]
+
+    This command looks in the appropriate remote for all remote branches in your configured
+    namespace (see 'git-plop aim' for namespace documentation). It then logs the tips of each.
 
 git-plop branch [-r] [remote [ref]]
 
@@ -344,10 +349,7 @@ class Repo:
             if target:
                 self.run(["update-ref", "refs/heads/plop/" + target, commit])
 
-    def fetch(self, remote=None):
-        if remote is None:
-            remote = self.get_default_remote()
-        self.run(["fetch", remote, "--prune"])
+    def each_remote(self, for_each, remote):
         remote_prefix = f"refs/remotes/{remote}/"
         prefix = f"{remote_prefix}{self.get_namespace()}/"
         branches = self.run(["for-each-ref", "--format=%(refname)", prefix]).stdout.splitlines()
@@ -356,7 +358,7 @@ class Repo:
             if not branch.startswith(prefix): continue
             target = branch.removeprefix(remote_prefix)
             seen_changes[self.change_id(ref=branch)].append(target)
-            self.aim(ref=branch, target=target)
+            for_each(ref=branch, target=target)
         warnings = []
         for change, targets in seen_changes.items():
             if len(targets) == 1: continue
@@ -365,6 +367,17 @@ class Repo:
             print("Warnings:", file=sys.stderr)
             for warning in warnings:
                 print("  " + warning, file=sys.stderr)
+
+    def fetch(self, remote=None):
+        if remote is None:
+            remote = self.get_default_remote()
+        self.run(["fetch", remote, "--prune"])
+        self.each_remote(self.aim, remote=remote)
+
+    def show_remote(self, remote=None):
+        if remote is None:
+            remote = self.get_default_remote()
+        self.each_remote(self.print_one, remote=remote)
 
 
 def usage(c=1):
@@ -446,6 +459,10 @@ def main():
         for ref in refs:
             repo.print_one(ref=ref)
         return
+
+    if cmd == "remote":
+        if len(args) > 1: usage()
+        return repo.show_remote(remote=(args[0] if len(args) == 1 else None))
 
     if cmd == "branch":
         remove, args = filter_flag("-r", args)
