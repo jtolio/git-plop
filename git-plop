@@ -79,13 +79,12 @@ git-plop branch [-r] [remote [ref]]
     a 'plop/' branch namespace for every aimed git commit in the local database. If [-r] is set,
     target branch annotations are removed.
 
-git-plop fetch [remote] [-b]
+git-plop fetch [remote]
 
     This command runs `git fetch` against the appropriate remote, then looks in that remote for
     all remote branches in your configured namespace (see 'git-plop aim' for namespace
     documentation). Once it identifies remote branches in your namespace, it makes sure that those
     changes have all been aimed to those remote branches.
-    If -b is provided, the equivalent of 'git-plop branch' is run on each synced ref.
 
 git-plop clean
 
@@ -99,13 +98,15 @@ import shutil
 import subprocess
 import sys
 
+from collections import defaultdict
+
 BRANCH_NAME_LEN = 12
 SHORTCODE_LEN = 6
 
 
 def trim_message(message):
     subject = message.split("\n", 1)[0]
-    subject = "".join([ch.lower() if ch.isalnum() else "-" for ch in subject])
+    subject = "-".join("".join(ch.lower() if ch.isalnum() else " " for ch in subject).split())
     return subject[:BRANCH_NAME_LEN].rstrip("-")
 
 
@@ -157,8 +158,8 @@ class Repo:
         except subprocess.CalledProcessError:
             raise SystemExit("error: plop.branch-namespace not set and whoami failed")
 
-    def generate_branch_name(self):
-        _, body = self.read_commit("HEAD")
+    def generate_branch_name(self, ref):
+        _, body = self.read_commit(ref)
         trimmed = trim_message(body)
         if trimmed:
             trimmed += "-"
@@ -265,17 +266,29 @@ class Repo:
             raise SystemExit("invalid target branch %r" % target)
         self.run(["check-ref-format", f"refs/heads/{target}"])
 
+    def print_one(self, ref, change_id=None, target=None):
+        if change_id is None:
+            change_id = self.change_id(ref)
+        if target is None:
+            target = self.lookup_by_change(change_id)
+        ref = self.run(["rev-parse", "--short", ref]).stdout.strip()
+        _, body = self.read_commit(ref)
+        subject = body.split("\n", 1)[0]
+        print("%s %s -> %s\t%s" % (ref, change_id, target or "_", subject))
+
     def aim(self, ref=None, target=None):
         if ref is None: ref = "HEAD"
         change_id = self.change_id(ref)
+        existing = self.lookup_by_change(change_id)
         if target is None:
-            if self.lookup_by_change(change_id): return
-            target = self.generate_branch_name()
+            if existing: return
+            target = self.generate_branch_name(ref)
+        if existing == target: return
         self.validate_branch_name(target)
         p = os.path.join(self.db_dir, change_id)
         with open(p, "w", encoding="utf-8") as fh:
             fh.write(target)
-        print("%s -> %s" % (change_id, target))
+        self.print_one(ref=ref, change_id=change_id, target=target)
 
     def disarm(self, ref=None):
         if ref is None: ref = "HEAD"
@@ -283,13 +296,11 @@ class Repo:
         p = os.path.join(self.db_dir, change_id)
         if not os.path.exists(p): return
         os.remove(p)
-        print("%s -> _" % change_id)
+        self.print_one(ref=ref, change_id=change_id, target="")
 
     def unmerged(self, remote=None, ref=None):
-        if ref is None:
-            ref = "HEAD"
-        if remote is None:
-            remote = self.get_default_remote()
+        if ref is None: ref = "HEAD"
+        if remote is None: remote = self.get_default_remote()
 
         base_ref = self.get_merge_base_ref(remote)
         merge_base = self.run(["merge-base", base_ref, ref]).stdout.strip()
@@ -333,19 +344,27 @@ class Repo:
             if target:
                 self.run(["update-ref", "refs/heads/plop/" + target, commit])
 
-    def fetch(self, remote=None, update_branches=False):
+    def fetch(self, remote=None):
         if remote is None:
             remote = self.get_default_remote()
-        self.run(["fetch", remote])
+        self.run(["fetch", remote, "--prune"])
         remote_prefix = f"refs/remotes/{remote}/"
         prefix = f"{remote_prefix}{self.get_namespace()}/"
         branches = self.run(["for-each-ref", "--format=%(refname)", prefix]).stdout.splitlines()
-        if update_branches: self.clean_branches()
-        for branch in branches:
+        seen_changes = defaultdict(list)
+        for branch in set(branches):
             if not branch.startswith(prefix): continue
             target = branch.removeprefix(remote_prefix)
+            seen_changes[self.change_id(ref=branch)].append(target)
             self.aim(ref=branch, target=target)
-            if update_branches: self.run(["update-ref", "refs/heads/plop/" + target, branch])
+        warnings = []
+        for change, targets in seen_changes.items():
+            if len(targets) == 1: continue
+            warnings.append("Multiple targets for change %s: %s" % (change, ", ".join(targets)))
+        if warnings:
+            print("Warnings:", file=sys.stderr)
+            for warning in warnings:
+                print("  " + warning, file=sys.stderr)
 
 
 def usage(c=1):
@@ -425,9 +444,7 @@ def main():
     if cmd == "log":
         _, _, refs = repo.unmerged(*remote_ref(args))
         for ref in refs:
-            change_id = repo.change_id(ref)
-            target = repo.lookup_by_change(change_id)
-            print("%s\t%s\t%s" % (ref, change_id, target or "_"))
+            repo.print_one(ref=ref)
         return
 
     if cmd == "branch":
@@ -438,9 +455,8 @@ def main():
         return repo.update_branches(*remote_ref(args))
 
     if cmd == "fetch":
-        branch, args = filter_flag("-b", args)
         if len(args) > 1: usage()
-        return repo.fetch(remote=(args[0] if len(args) == 1 else None), update_branches=branch)
+        return repo.fetch(remote=(args[0] if len(args) == 1 else None))
 
     if cmd == "clean":
         if len(args) > 0: usage()
