@@ -158,6 +158,9 @@ class Repo:
         h = hashlib.sha256(("plop-id " + author[0]).encode("utf-8"))
         return base64.b32encode(h.digest())[:20].decode("utf-8").lower()
 
+    def short_ref(self, ref):
+        return self.run(["rev-parse", "--short", ref]).stdout.strip()
+
     def get_namespace(self):
         ns = self.run(["config", "--default", "", "plop.branch-namespace"]).stdout.strip()
         if ns: return ns
@@ -279,10 +282,10 @@ class Repo:
             change_id = self.change_id(ref)
         if target is None:
             target = self.lookup_by_change(change_id)
-        ref = self.run(["rev-parse", "--short", ref]).stdout.strip()
         _, body = self.read_commit(ref)
         subject = body.split("\n", 1)[0]
-        print("%s %s -> %s\t%s" % (ref, change_id, target or "_", subject))
+        print("%s %s -> %s\t%s" % (
+            self.short_ref(ref), change_id, target or "_", subject))
 
     def aim(self, ref=None, target=None):
         if ref is None: ref = "HEAD"
@@ -336,12 +339,16 @@ class Repo:
         self.run(["push", "--atomic", "--force-with-lease", remote] + refspecs,
                  capture_output=False)
 
+    def branch_tag_name(self, ref, target=None):
+        if target is None: target = self.lookup(ref)
+        return f"refs/heads/plop/{target}/{self.short_ref(ref)}"
+
     def clean_branches(self, remove_all=False):
         local_branches = self.run([
             "for-each-ref", "--format=%(refname)", "refs/heads/plop/"]).stdout.splitlines()
         for branch in local_branches:
             if not branch.startswith("refs/heads/plop/"): continue
-            if remove_all or branch != "refs/heads/plop/" + self.lookup(branch):
+            if remove_all or branch != self.branch_tag_name(branch):
                 self.run(["update-ref", "-d", branch])
 
     def update_branches(self, remote=None, ref=None):
@@ -350,8 +357,7 @@ class Repo:
         for commit in commits:
             target = self.lookup(commit)
             if target:
-                short = self.run(["rev-parse", "--short", commit]).stdout.strip()
-                self.run(["update-ref", f"refs/heads/plop/{target}/{short}", commit])
+                self.run(["update-ref", self.branch_tag_name(commit, target=target), commit])
 
     def each_remote(self, for_each, remote):
         remote_prefix = f"refs/remotes/{remote}/"
@@ -416,6 +422,7 @@ def main():
                 continue
             if ref is not None: usage()
             ref = arg
+        if remote_flag: usage()
         return remote, ref
 
     def filter_flag(flag, args):
