@@ -73,10 +73,11 @@ git-plop log [-r remote] [ref]
     This command shows the current unmerged commits along with their change ids and destination
     branches.
 
-git-plop remote [remote]
+git-plop remote [remote] [-a]
 
     This command looks in the appropriate remote for all remote branches in your configured
     namespace (see 'git-plop aim' for namespace documentation). It then logs the tips of each.
+    If [-a] is not provided, only branches that are not ancestors of other branches will be shown.
 
 git-plop branch [-r remote] [ref]
 
@@ -230,8 +231,7 @@ class Repo:
                  f"{start_hash}..{end_hash}"]
             ).stdout
         except subprocess.CalledProcessError:
-            raise SystemExit(
-                f"error: no path found from {start_hash[:12]} to {end_hash[:12]}")
+            return None
 
         ancestors = {}
         for line in output.splitlines():
@@ -241,22 +241,20 @@ class Repo:
             commit = parts[0]
             parents = parts[1:]
             if len(parents) > 1:
-                raise SystemExit("merge commit rejected")
+                print("Warning: merge commit rejected", file=sys.stderr)
+                return None
             ancestors[commit] = parents[0]
 
         # An empty result (rev-list exits 0 with no output) means end is not a
         # descendant of start at all.
         if not ancestors:
-            raise SystemExit(
-                f"error: no path found from {start_hash[:12]} to {end_hash[:12]}")
+            return None
 
         node = end_hash
         path = []
         while node != start_hash:
             if node not in ancestors:
-                raise SystemExit(
-                    f"error: no unique linear path from {start_hash[:12]} to "
-                    f"{end_hash[:12]} (chain broken at {node[:12]})")
+                return None
             path.append(node)
             node = ancestors[node]
 
@@ -277,15 +275,19 @@ class Repo:
             raise SystemExit("invalid target branch %r" % target)
         self.run(["check-ref-format", f"refs/heads/{target}"])
 
-    def print_one(self, ref, change_id=None, target=None):
+    def print_one(self, ref, change_id=None, target=None, annotation=None):
         if change_id is None:
             change_id = self.change_id(ref)
         if target is None:
             target = self.lookup_by_change(change_id)
         _, body = self.read_commit(ref)
         subject = body.split("\n", 1)[0]
-        print("%s %s -> %s\t%s" % (
-            self.short_ref(ref), change_id, target or "_", subject))
+        if annotation is None:
+            annotation = ""
+        else:
+            annotation = " " + annotation
+        print("%s %s -> %s\t%s%s" % (
+            self.short_ref(ref), change_id, target or "_", subject, annotation))
 
     def aim(self, ref=None, target=None):
         if ref is None: ref = "HEAD"
@@ -317,6 +319,10 @@ class Repo:
         merge_base = self.run(["merge-base", base_ref, ref]).stdout.strip()
 
         commits = self.find_unique_path(merge_base, ref)
+        if commits is None:
+            raise SystemExit(
+                f"error: no path found from {self.short_ref(merge_base)} to {self.short_ref(ref)}")
+
         return (remote, ref, commits)
 
     def lob(self, remote=None, ref=None):
@@ -384,10 +390,27 @@ class Repo:
         self.run(["fetch", remote, "--prune"])
         self.each_remote(self.aim, remote=remote)
 
-    def show_remote(self, remote=None):
+    def show_remote(self, remote=None, show_all=False):
         if remote is None:
             remote = self.get_default_remote()
-        self.each_remote(self.print_one, remote=remote)
+        targets = {}
+        def observe(ref, target):
+            targets[ref] = target
+        self.each_remote(observe, remote=remote)
+        to_show = []
+        for ref in sorted(targets.keys()):
+            if not show_all:
+                for other_ref in targets.keys():
+                    path = self.find_unique_path(ref, other_ref)
+                    if path is None or len(path) == 0: continue
+                    del targets[ref]
+                    break
+            if ref in targets:
+                _, _, unmerged = self.unmerged(remote=remote, ref=ref)
+                to_show.append((ref, targets[ref], unmerged))
+        to_show.sort(key=lambda t: (-len(t[2]), t[1], t[0]))
+        for ref, target, unmerged in to_show:
+            self.print_one(ref=ref, target=target, annotation=f"({len(unmerged)})")
 
 
 def usage(c=1):
@@ -481,8 +504,9 @@ def main():
         return
 
     if cmd == "remote":
+        show_all, args = filter_flag("-a", args)
         if len(args) > 1: usage()
-        return repo.show_remote(remote=(args[0] if len(args) == 1 else None))
+        return repo.show_remote(remote=(args[0] if len(args) == 1 else None), show_all=show_all)
 
     if cmd == "branch":
         return repo.update_branches(*remote_ref(args))
