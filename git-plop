@@ -2,44 +2,52 @@
 
 USAGE = """git-plop
 
-git-plop enables updating multiple remote branches from unmerged commits on a single local branch.
+git-plop enables updating multiple remote branches from unmerged commits on a
+single local branch.
 
-git-plop works primarily using a pseudo "change id", akin to a Gerrit or Jujutsu change id,
-calculated as a hash of the author's name, email, time, and timezone. Author information within a
-commit rarely changes across rebases or cherry-picks, and authors rarely commit more than once a
-second. Note that git-plop will behave strangely if a particular author commits more than once a
+git-plop works primarily using a pseudo "change id", akin to a Gerrit or
+Jujutsu change id, calculated as a hash of the author's name, email, time, and
+timezone. Author information within a commit rarely changes across rebases or
+cherry-picks, and authors rarely commit more than once a second. Note that
+git-plop will behave strangely if a particular author commits more than once a
 second.
 
-git-plop keeps a small database in the current repo's .git/info/plop/ (overridable with
-git config plop.db-path) which includes mappings of change ids to target branches.
+git-plop keeps a small database in the current repo's .git/info/plop/
+(overridable with git config plop.db-path) which includes mappings of change
+ids to target branches.
 
 git-plop aim [ref [ref [ref ...]]]
 git-plop aim --all [-r remote] [ref]
 git-plop aim [ref] -t target-branch
 
-    This command sets the target branch of a particular ref in the plop database.
+    This command sets the target branch of a particular ref in the plop
+    database.
 
-    If no arguments are provided, it generates a target branch name and sets it for HEAD if HEAD
-    does not already have one.
-    If --all is provided, then all unmerged commits are aimed with a synthetic branch if they don't
-    already have one. See 'git-plop unmerged'.
-    If one or more arguments are provided without -t, each argument is set to a new synthetic
-    target branch if one does not exist.
-    If -t is provided, then the given ref (or HEAD, if none is given) is set to the given branch.
+    If no arguments are provided, it generates a target branch name and sets it
+    for HEAD if HEAD does not already have one.
+    If --all is provided, then all unmerged commits are aimed with a synthetic
+    branch if they don't already have one. See 'git-plop unmerged'.
+    If one or more arguments are provided without -t, each argument is set to a
+    new synthetic target branch if one does not exist.
+    If -t is provided, then the given ref (or HEAD, if none is given) is set to
+    the given branch.
 
-    If target-branch is not specified, it is generated with the following format:
+    If target-branch is not specified, it is generated with the following
+    format:
 
         <namespace>/<trimmed-message>-<shortcode>
 
-    <namespace> is determined by either looking in git config for 'plop.branch-namespace' or using
-    the current system username.
-    <trimmed-message> is determined by taking the first 12 alphanumeric characters of the commit
-    message. Non-alphanumeric characters are replaced with dashes.
+    <namespace> is determined by either looking in git config for
+    'plop.branch-namespace' or using the current system username.
+    <trimmed-message> is determined by taking the first 12 alphanumeric
+    characters of the commit message. Non-alphanumeric characters are replaced
+    with dashes.
     <shortcode> is 6 random base 32 digits from /dev/urandom.
 
 git-plop disarm [ref [ref [ref ...]]]
 
-    This command undoes git-plop aim for the given refs, defaulting to HEAD if none are given.
+    This command undoes git-plop aim for the given refs, defaulting to HEAD if
+    none are given.
 
 git-plop id [ref]
 
@@ -47,54 +55,63 @@ git-plop id [ref]
 
 git-plop lookup [ref]
 
-    This command shows the git-plop destination branch for the ref, defaulting to HEAD.
+    This command shows the git-plop destination branch for the ref, defaulting
+    to HEAD.
 
 git-plop unmerged [-r remote] [ref]
 
-    This command shows all commits on the current branch that are currently unmerged to the remote
-    branch. It does this by looking at the ref, finding the merge-base of ref and the current remote
-    tracking branch (or the default branch on the remote if no tracking branch is found), and then
+    This command shows all commits on the current branch that are currently
+    unmerged to the remote branch. It does this by looking at the ref, finding
+    the merge-base of ref and the current remote tracking branch (or the
+    default branch on the remote if no tracking branch is found), and then
     looking at that chain.
-    The commit chain from merge-base to ref must be a unique linear path. If multiple paths
-    exist, an error is raised.
+    The commit chain from merge-base to ref must be a unique linear path. If
+    multiple paths exist, an error is raised.
 
-    If remote is not specified, it defaults to the default remote that git push would use.
+    If remote is not specified, it defaults to the default remote that git push
+    would use.
     If ref is not specified, it defaults to HEAD.
 
 git-plop lob [-r remote] [ref]
 
-    For each commit in the unmerged set, this command considers whether it has been aimed. If so,
-    it adds it to a refspec to push to the remote with --atomic and --force-with-lease.
-    This will update the specified remote branch for every commit that is found to have a
-    destination. No other refs besides aimed refs are pushed.
+    For each commit in the unmerged set, this command considers whether it has
+    been aimed. If so, it adds it to a refspec to push to the remote with
+    --atomic and --force-with-lease. This will update the specified remote
+    branch for every commit that is found to have a destination. No other refs
+    besides aimed refs are pushed.
 
 git-plop log [-r remote] [ref]
 
-    This command shows the current unmerged commits along with their change ids and destination
-    branches.
+    This command shows the current unmerged commits along with their change ids
+    and destination branches.
 
 git-plop rebase [-r remote] [ref]
 
-    This command starts an interactive rebase of all of your changes in the current stack.
+    This command starts an interactive rebase of all of your changes in the
+    current stack.
 
 git-plop remote [remote] [-a] [-f]
 
-    This command looks in the appropriate remote for all remote branches in your configured
-    namespace (see 'git-plop aim' for namespace documentation). It then logs the tips of each.
-    If [-a] is not provided, only branches that are not ancestors of other branches will be shown.
+    This command looks in the appropriate remote for all remote branches in
+    your configured namespace (see 'git-plop aim' for namespace documentation).
+    It then logs the tips of each.
+    If [-a] is not provided, only branches that are not ancestors of other
+    branches will be shown.
     If [-f] is provided, `git-plop fetch -q` runs first.
 
 git-plop branch [-r remote] [ref]
 
-    For better usability with other tools, this tool will make or update local git-plop branches in
-    a 'plop/' branch namespace for every aimed git commit in the local database.
+    For better usability with other tools, this tool will make or update local
+    git-plop branches in a 'plop/' branch namespace for every aimed git commit
+    in the local database.
 
 git-plop fetch [remote] [-q]
 
-    This command runs `git fetch` against the appropriate remote, then looks in that remote for
-    all remote branches in your configured namespace (see 'git-plop aim' for namespace
-    documentation). Once it identifies remote branches in your namespace, it makes sure that those
-    changes have all been aimed to those remote branches.
+    This command runs `git fetch` against the appropriate remote, then looks in
+    that remote for all remote branches in your configured namespace (see
+    'git-plop aim' for namespace documentation). Once it identifies remote
+    branches in your namespace, it makes sure that those changes have all been
+    aimed to those remote branches.
     If [-q] is provided, no update output is shown.
 
 git-plop unbranch
