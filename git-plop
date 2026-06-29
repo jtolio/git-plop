@@ -73,23 +73,29 @@ git-plop log [-r remote] [ref]
     This command shows the current unmerged commits along with their change ids and destination
     branches.
 
-git-plop remote [remote] [-a]
+git-plop rebase [-r remote] [ref]
+
+    This command starts an interactive rebase of all of your changes in the current stack.
+
+git-plop remote [remote] [-a] [-f]
 
     This command looks in the appropriate remote for all remote branches in your configured
     namespace (see 'git-plop aim' for namespace documentation). It then logs the tips of each.
     If [-a] is not provided, only branches that are not ancestors of other branches will be shown.
+    If [-f] is provided, `git-plop fetch -q` runs first.
 
 git-plop branch [-r remote] [ref]
 
     For better usability with other tools, this tool will make or update local git-plop branches in
     a 'plop/' branch namespace for every aimed git commit in the local database.
 
-git-plop fetch [remote]
+git-plop fetch [remote] [-q]
 
     This command runs `git fetch` against the appropriate remote, then looks in that remote for
     all remote branches in your configured namespace (see 'git-plop aim' for namespace
     documentation). Once it identifies remote branches in your namespace, it makes sure that those
     changes have all been aimed to those remote branches.
+    If [-q] is provided, no update output is shown.
 
 git-plop unbranch
 
@@ -289,7 +295,7 @@ class Repo:
         print("%s %s -> %s\t%s%s" % (
             self.short_ref(ref), change_id, target or "_", subject, annotation))
 
-    def aim(self, ref=None, target=None):
+    def aim(self, ref=None, target=None, quiet=False):
         if ref is None: ref = "HEAD"
         change_id = self.change_id(ref)
         existing = self.lookup_by_change(change_id)
@@ -301,7 +307,8 @@ class Repo:
         p = os.path.join(self.db_dir, change_id)
         with open(p, "w", encoding="utf-8") as fh:
             fh.write(target)
-        self.print_one(ref=ref, change_id=change_id, target=target)
+        if not quiet:
+            self.print_one(ref=ref, change_id=change_id, target=target)
 
     def disarm(self, ref=None):
         if ref is None: ref = "HEAD"
@@ -323,10 +330,10 @@ class Repo:
             raise SystemExit(
                 f"error: no path found from {self.short_ref(merge_base)} to {self.short_ref(ref)}")
 
-        return (remote, ref, commits)
+        return (remote, ref, merge_base, commits)
 
     def lob(self, remote=None, ref=None):
-        remote, ref, commits = self.unmerged(remote=remote, ref=ref)
+        remote, ref, _, commits = self.unmerged(remote=remote, ref=ref)
 
         if not commits:
             print("No commits found.", file=sys.stderr)
@@ -359,7 +366,7 @@ class Repo:
 
     def update_branches(self, remote=None, ref=None):
         self.clean_branches()
-        _, _, commits = self.unmerged(remote=remote, ref=ref)
+        _, _, _, commits = self.unmerged(remote=remote, ref=ref)
         for commit in commits:
             target = self.lookup(commit)
             if target:
@@ -384,11 +391,13 @@ class Repo:
             for warning in warnings:
                 print("  " + warning, file=sys.stderr)
 
-    def fetch(self, remote=None):
+    def fetch(self, remote=None, quiet=False):
         if remote is None:
             remote = self.get_default_remote()
         self.run(["fetch", remote, "--prune"])
-        self.each_remote(self.aim, remote=remote)
+        def aim(ref, target):
+            self.aim(ref=ref, target=target, quiet=quiet)
+        self.each_remote(aim, remote=remote)
 
     def show_remote(self, remote=None, show_all=False):
         if remote is None:
@@ -406,7 +415,7 @@ class Repo:
                     del targets[ref]
                     break
             if ref in targets:
-                _, _, unmerged = self.unmerged(remote=remote, ref=ref)
+                _, _, _, unmerged = self.unmerged(remote=remote, ref=ref)
                 to_show.append((ref, targets[ref], unmerged))
         to_show.sort(key=lambda t: (-len(t[2]), t[1], t[0]))
         for ref, target, unmerged in to_show:
@@ -454,7 +463,7 @@ def main():
     if cmd == "aim":
         if "--all" in args:
             if args[0] != "--all": usage()
-            _, _, refs = repo.unmerged(*remote_ref(args[1:]))
+            _, _, _, refs = repo.unmerged(*remote_ref(args[1:]))
             for ref in refs:
                 repo.aim(ref=ref)
             return
@@ -489,7 +498,7 @@ def main():
         return
 
     if cmd == "unmerged":
-        _, _, refs = repo.unmerged(*remote_ref(args))
+        _, _, _, refs = repo.unmerged(*remote_ref(args))
         for ref in refs:
             print(ref)
         return
@@ -498,15 +507,23 @@ def main():
         return repo.lob(*remote_ref(args))
 
     if cmd == "log":
-        _, _, refs = repo.unmerged(*remote_ref(args))
+        _, _, _, refs = repo.unmerged(*remote_ref(args))
         for ref in reversed(refs):
             repo.print_one(ref=ref)
         return
 
+    if cmd == "rebase":
+        _, _, merge_base, _ = repo.unmerged(*remote_ref(args))
+        repo.run(["rebase", "-i", "--no-update-refs", merge_base], capture_output=False)
+        return
+
     if cmd == "remote":
         show_all, args = filter_flag("-a", args)
+        fetch, args = filter_flag("-f", args)
         if len(args) > 1: usage()
-        return repo.show_remote(remote=(args[0] if len(args) == 1 else None), show_all=show_all)
+        remote = args[0] if len(args) == 1 else None
+        if fetch: repo.fetch(remote=remote, quiet=True)
+        return repo.show_remote(remote=remote, show_all=show_all)
 
     if cmd == "branch":
         return repo.update_branches(*remote_ref(args))
@@ -515,8 +532,9 @@ def main():
         return repo.clean_branches(remove_all=True)
 
     if cmd == "fetch":
+        quiet, args = filter_flag("-q", args)
         if len(args) > 1: usage()
-        return repo.fetch(remote=(args[0] if len(args) == 1 else None))
+        return repo.fetch(remote=(args[0] if len(args) == 1 else None), quiet=quiet)
 
     if cmd == "clean":
         if len(args) > 0: usage()
