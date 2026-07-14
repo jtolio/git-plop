@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+
+USAGE = """git-boop
+
+git-boop is a collection of tools for managing local git commit stacks.
+
+git-boop treesame-cherry-pick ref [-m message]
+
+    This command makes a commit where the new commit has the exact same tree
+    as the provided ref.
+
+git-boop treesame-fold tip
+
+    Let's say you are happy with the current stack of commits, but want to move
+    some edits from one commit in your stack to another. Let's say you have three
+    refs, ref1, ref2, and ref3, where ref3 is a descendent of ref2, ref2 is a
+    descendent of ref1. You like the resulting tree of ref3, but you think some
+    of the changes in the tree at ref2 should be in commit ref1.
+
+    So you run `git reset --hard ref1`, then you apply the edits you think
+    should be in ref1, then you amend ref1. Now you want to stack the rest of
+    ref2...ref3 on top of ref1, but keep it so the tree at ref2 is exactly the
+    same. You could individually use treesame-cherry-pick, but that's tiresome
+    for a stack. So `treesame-fold ref3` runs treesame-cherry-pick for you on
+    ref2, then ref3, and so on, for all relevant commits. It does this by walking
+    down from ref3 until it finds the same `git-plop` change id as ref1.
+"""
+
+import os
+import subprocess
+import sys
+
+
+class Repo:
+    def __init__(self, work_dir=None):
+        self.work_dir = work_dir
+
+    def run(self, args, check_returncode=True, capture_output=True, **kwargs):
+        cmd = ["git"] + args
+        result = subprocess.run(cmd, cwd=self.work_dir, text=True, capture_output=capture_output,
+                                **kwargs)
+        if check_returncode:
+            result.check_returncode()
+        return result
+
+    def validate(self):
+        self.run(["rev-parse", "--git-dir"])
+        self.run(["rev-parse", "HEAD"])
+
+    def read_commit(self, ref):
+        header, _, body = self.run(["cat-file", "-p", ref]).stdout.partition("\n\n")
+        return header, body
+
+    def write_commit_object(self, header, body):
+        full = header + "\n\n" + body
+        if full and not full.endswith("\n"):
+            full += "\n"
+        return self.run(
+            ["hash-object", "-t", "commit", "-w", "--stdin"],
+            input=full,
+        ).stdout.strip()
+
+    def update_head(self, new_commit):
+        try:
+            symref = self.run(["symbolic-ref", "-q", "HEAD"])
+        except subprocess.CalledProcessError:
+            self.run(["update-ref", "HEAD", new_commit])
+        else:
+            self.run(["update-ref", symref.stdout.strip(), new_commit])
+
+    def ref(self, ref):
+        return self.run(["rev-parse", ref]).stdout.strip()
+
+    def parent(self, ref):
+        header, _ = self.read_commit(ref)
+        parent = None
+        for line in header.splitlines():
+            if line.startswith("parent "):
+                if parent is not None:
+                    raise Exception("Merge commits unsupported!")
+                parent = line.removeprefix("parent ")
+        return parent
+
+    def treesame_cherry_pick(self, commit, message=None):
+        header, body = self.read_commit(commit)
+        header = header.splitlines()
+        assert header[0].startswith("tree ")
+        new_header = [header[0], "parent %s" % self.ref("HEAD")]
+        in_gpgsig = False
+        for line in header[1:]:
+            if in_gpgsig:
+                if line.startswith(" "): continue
+                in_gpgsig = False
+            if line.startswith("parent "): continue
+            if line.startswith("gpgsig"):
+                print("Warning: dropped gpg signature", file=sys.stderr)
+                in_gpgsig = True
+                continue
+            new_header.append(line)
+        if message is not None:
+            body = message
+        self.update_head(self.write_commit_object("\n".join(new_header), body))
+
+    def treesame_fold(self, tip):
+        merge_base = self.run(["merge-base", "HEAD", tip]).stdout.strip()
+        current_change_ids = set()
+        current = self.ref("HEAD")
+        while True:
+            current_change_ids.add(self.run(["plop", "id", current]).stdout.strip())
+            if current == merge_base: break
+            current = self.parent(current)
+            assert current is not None
+
+        to_apply = []
+        while True:
+            tip_change_id = self.run(["plop", "id", tip]).stdout.strip()
+            if tip_change_id in current_change_ids:
+                break
+            to_apply.append(tip)
+            tip = self.parent(tip)
+            assert tip is not None
+
+        for ref in reversed(to_apply):
+            self.treesame_cherry_pick(ref)
+
+
+def usage(c=1):
+    print(USAGE)
+    sys.exit(c)
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or "-h" in args or "--help" in args:
+        usage(0)
+
+    repo = Repo()
+    repo.validate()
+
+    cmd, args = args[0], args[1:]
+
+    if cmd == "treesame-cherry-pick":
+        if len(args) not in (1, 3): usage()
+        message = None
+        if len(args) == 3:
+            if args[0] == "-m":
+                message = args[1]
+                args = args[2:]
+            elif args[1] == "-m":
+                message = args[2]
+                args = args[:1]
+            else:
+                usage()
+        return repo.treesame_cherry_pick(args[0], message=message)
+
+    if cmd == "treesame-fold":
+        if len(args) != 1: usage()
+        return repo.treesame_fold(args[0])
+
+    print(f"Unknown command: {cmd}", file=sys.stderr)
+    usage()
+
+
+if __name__ == "__main__":
+    main()
