@@ -30,7 +30,7 @@ class Repo:
 
     def run(self, args, check_returncode=True, capture_output=True, **kwargs):
         cmd = ["git"] + args
-        if args[0] in ("push", "hash-object", "update-ref", "mktree"):
+        if args[0] in ("push", "hash-object", "update-ref", "mktree", "read-tree"):
             print(cmd, file=sys.stderr)
         result = subprocess.run(cmd, cwd=self.work_dir, text=True, capture_output=capture_output,
                                 **kwargs)
@@ -56,6 +56,8 @@ class Repo:
         ).stdout.strip()
 
     def update_head(self, new_commit):
+        self.run(["read-tree", "-u", "-m", "HEAD^{tree}", new_commit + "^{tree}"],
+                 capture_output=False)
         try:
             symref = self.run(["symbolic-ref", "-q", "HEAD"])
         except subprocess.CalledProcessError:
@@ -145,7 +147,7 @@ class Repo:
     def align(self, remote=None):
         # Get unique path from merge-base to HEAD
         a_commits = self.run(
-            ["plop", "unmerged"] + ([remote] if remote is not None else [])).stdout.splitlines()
+            ["plop", "unmerged"] + (["-r", remote] if remote is not None else [])).stdout.splitlines()
         if not a_commits:
             print("No commits to align.", file=sys.stderr)
             return
@@ -312,7 +314,7 @@ def usage(c=1):
 def main():
     args = sys.argv[1:]
 
-    if not args or "-h" in args or "--help" in args:
+    if "-h" in args or "--help" in args:
         usage(0)
 
     repo = Repo()
@@ -323,4 +325,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except subprocess.CalledProcessError as e:
+        if e.stderr:
+            sys.stderr.write(e.stderr)
+        sys.exit(e.returncode)
