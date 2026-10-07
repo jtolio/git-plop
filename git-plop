@@ -49,6 +49,12 @@ git-plop disarm [ref [ref [ref ...]]]
     This command undoes git-plop aim for the given refs, defaulting to HEAD if
     none are given.
 
+git-plop adopt [-r remote] [ref]
+
+    This command looks at the unmerged stack and finds the top-most aimed
+    commit. It disarms that commit and aims the top commit to the
+    disarmed commit's former target.
+
 git-plop id [ref]
 
     This command shows the git-plop change id for the ref, defaulting to HEAD.
@@ -502,6 +508,16 @@ def main():
         for ref in args:
             repo.disarm(ref=ref)
         return
+
+    if cmd == "adopt":
+        remote, top_ref = remote_ref(args)
+        _, _, _, refs = repo.unmerged(remote, top_ref)
+        for ref in reversed(refs):
+            target = repo.lookup(ref=ref)
+            if target:
+                repo.disarm(ref)
+                return repo.aim(ref=top_ref, target=target)
+        raise SystemExit("no existing aimed ref found in unmerged stack")
 
     if cmd == "id":
         if len(args) > 1: usage()
